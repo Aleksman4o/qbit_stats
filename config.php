@@ -24,6 +24,7 @@ function parseClientsConfig() {
 
         $protocol = ($client['ssl'] ?? 0) == 1 ? 'https://' : 'http://';
         $url = $protocol . $client['hostname'] . ':' . $client['port'];
+        $verifyCert = (bool)($client['verify_cert'] ?? false);
 
         $instances[] = [
             'name' => $client['comment'] ?? 'Client ' . ($client['id'] ?? 'unknown'),
@@ -31,7 +32,8 @@ function parseClientsConfig() {
             'username' => $client['login'] ?? '',
             'password' => $client['password'] ?? '',
             'id' => $client['id'] ?? null,
-            'ssl' => (bool)($client['ssl'] ?? false)
+            'ssl' => (bool)($client['ssl'] ?? false),
+            'verify_cert' => $verifyCert
         ];
     }
 
@@ -41,7 +43,18 @@ function parseClientsConfig() {
 
     return [
         'instances' => $instances,
-        'db_path' => __DIR__.'/qbittorrent_stats.db'
+        'db_path' => __DIR__ . '/qbittorrent_stats.db',
+        'settings' => [
+            'refresh_ttl_seconds' => 60,
+            'history_hours_default' => 6,
+            'history_hours_options' => [1, 6, 24],
+            'history_retention_days' => 7,
+            'connect_timeout_seconds' => 5,
+            'request_timeout_seconds' => 30,
+            'parallel_sync_limit' => 7,
+            'debug_sync' => false,
+            'lock_path' => __DIR__ . '/qbittorrent_stats.lock',
+        ],
     ];
 }
 

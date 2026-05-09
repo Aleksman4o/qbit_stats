@@ -1,943 +1,1504 @@
 <?php
-$config = require __DIR__.'/config.php';
-require __DIR__.'/data_functions.php';
 
-// Подключение к БД
-$db = new SQLite3($config['db_path']);
-$db->exec('PRAGMA journal_mode=WAL');
+$config = require __DIR__ . '/config.php';
+require_once __DIR__ . '/collector.php';
+require_once __DIR__ . '/data_functions.php';
 
-// Создание таблиц, если они не существуют
-$db->exec('CREATE TABLE IF NOT EXISTS instances (
-    name TEXT PRIMARY KEY,
-    dl_speed INTEGER,
-    up_speed INTEGER,
-    dl_session INTEGER,
-    up_session INTEGER,
-    last_update DATETIME
-)');
+$db = open_database($config);
+$initialRefreshMeta = [
+    'requested' => false,
+    'needed' => is_refresh_needed($db, $config),
+    'performed' => false,
+    'in_progress' => false,
+    'latest_update' => get_latest_update($db),
+];
+$currentData = get_current_data($db, $config, $initialRefreshMeta);
+$historyData = get_history_data($db, $config, $currentData['meta']['history_hours_default']);
+$db->close();
 
-$db->exec('CREATE TABLE IF NOT EXISTS categories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_name TEXT,
-    category TEXT,
-    active_torrents INTEGER,
-    dl_speed INTEGER,
-    up_speed INTEGER,
-    total_size INTEGER,
-    uploaded_session INTEGER,
-    last_update DATETIME,
-    UNIQUE(instance_name, category)
-)');
-
-$db->exec('CREATE TABLE IF NOT EXISTS speed_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_name TEXT,
-    dl_speed INTEGER,
-    up_speed INTEGER,
-    timestamp DATETIME
-)');
-
-$db->exec('CREATE TABLE IF NOT EXISTS category_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_name TEXT,
-    category TEXT,
-    active_torrents INTEGER,
-    dl_speed INTEGER,
-    up_speed INTEGER,
-    total_size INTEGER,
-    uploaded_session INTEGER,
-    timestamp DATETIME
-)');
-
-
-
-$current_data = get_current_data($db, $config); // Теперь с параметрами
-
-function get_history_data($hours = 24) {
-    global $db;
-    $cutoff = date('Y-m-d H:i:s', time() - $hours * 3600);
-    
-    $result = $db->query("SELECT 
-        timestamp,
-        instance_name,
-        dl_speed,
-        up_speed
-        FROM speed_history
-        WHERE timestamp >= '$cutoff'
-        ORDER BY timestamp ASC");
-        
-    $data = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $data[] = $row;
-    }
-    return $data;
+function json_for_script($value): string
+{
+    return json_encode(
+        $value,
+        JSON_UNESCAPED_UNICODE
+        | JSON_UNESCAPED_SLASHES
+        | JSON_HEX_TAG
+        | JSON_HEX_AMP
+        | JSON_HEX_APOS
+        | JSON_HEX_QUOT
+    );
 }
 
-$history_data = get_history_data(6); // Получить данные за последние 6 часов
+function format_speed($bytes): string
+{
+    $units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
+    $bytes = max((float)$bytes, 0);
+    $power = $bytes > 0 ? min((int)floor(log($bytes, 1024)), count($units) - 1) : 0;
 
-// Функции форматирования
-function format_speed($bytes) {
-    $units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-    $bytes = max($bytes, 0);
-    $pow = $bytes ? floor(log($bytes)/log(1024)) : 0;
-    return round($bytes/pow(1024,$pow),2).' '.$units[min($pow, count($units)-1)];
+    return round($bytes / (1024 ** $power), 2) . ' ' . $units[$power];
 }
 
-function format_size($bytes) {
+function format_size($bytes): string
+{
     $units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-    $bytes = max($bytes, 0);
-    $pow = $bytes ? floor(log($bytes)/log(1024)) : 0;
-    return round($bytes/pow(1024,$pow),2).' '.$units[min($pow, count($units)-1)];
+    $bytes = max((float)$bytes, 0);
+    $power = $bytes > 0 ? min((int)floor(log($bytes, 1024)), count($units) - 1) : 0;
+
+    return round($bytes / (1024 ** $power), 2) . ' ' . $units[$power];
 }
+
+function calculate_category_totals(array $categories): array
+{
+    return [
+        'count' => count($categories),
+        'up_speed' => array_sum(array_column($categories, 'up_speed')),
+        'dl_speed' => array_sum(array_column($categories, 'dl_speed')),
+        'active_torrents' => array_sum(array_column($categories, 'active_torrents')),
+    ];
+}
+
+$categoryTotals = calculate_category_totals($currentData['categories']);
+$historyOptions = $currentData['meta']['history_hours_options'];
+$defaultHistoryHours = $historyData['hours'];
 ?>
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
-    <title>qBittorrent Monitor</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>qBittorrent Category Monitor</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .chart-container {
-            margin: 30px 0;
-            height: 400px;
-            width: 90%;
-            background: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            padding: 15px;
+        :root {
+            --bg: #eef2eb;
+            --panel: #f9fbf7;
+            --panel-strong: #ffffff;
+            --border: #d7e0d1;
+            --text: #1f2a1f;
+            --muted: #607062;
+            --accent: #1e7a47;
+            --accent-soft: rgba(30, 122, 71, 0.12);
+            --warning: #9a6b00;
+            --warning-soft: rgba(154, 107, 0, 0.12);
+            --danger: #b8453b;
+            --danger-soft: rgba(184, 69, 59, 0.12);
+            --shadow: 0 18px 40px rgba(34, 54, 35, 0.08);
         }
-        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
-        .refresh-controls { margin: 20px 0; }
-        .last-update { color: #666; font-size: 0.9em; }
-        .status { padding: 10px; margin: 10px 0; border-radius: 4px; display: none; position: fixed; background: #fcffaa;}
-        .status.success { background: #d4edda; display: block; }
-        .status.error { background: #f8d7da; display: block; }
-        .category-table { margin-top: 30px; }
-        .sortable {
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 28px;
+            background:
+                radial-gradient(circle at top left, rgba(30, 122, 71, 0.10), transparent 30%),
+                linear-gradient(180deg, #f4f7f0 0%, var(--bg) 100%);
+            color: var(--text);
+            font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        }
+
+        .page {
+            max-width: 1480px;
+            margin: 0 auto;
+        }
+
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 24px;
+            align-items: flex-start;
+            margin-bottom: 20px;
+        }
+
+        .eyebrow {
+            margin: 0 0 8px;
+            font-size: 0.78rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--accent);
+            font-weight: 700;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: clamp(2rem, 3vw, 3rem);
+            line-height: 1;
+        }
+
+        .subtitle {
+            margin: 12px 0 0;
+            max-width: 780px;
+            color: var(--muted);
+            font-size: 1rem;
+        }
+
+        .header-meta {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            align-items: flex-end;
+        }
+
+        .panel {
+            background: linear-gradient(180deg, var(--panel-strong) 0%, var(--panel) 100%);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            box-shadow: var(--shadow);
+        }
+
+        .toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 16px 18px;
+            margin-bottom: 18px;
+        }
+
+        .toolbar-group {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .toolbar label {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--muted);
+            font-size: 0.94rem;
+        }
+
+        .toolbar select,
+        .toolbar button {
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            font: inherit;
+        }
+
+        .toolbar select {
+            min-width: 90px;
+            padding: 10px 12px;
+            background: #fff;
+            color: var(--text);
+        }
+
+        .toolbar button {
+            padding: 10px 16px;
+            background: var(--accent);
+            color: #fff;
+            cursor: pointer;
+            transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+            box-shadow: 0 10px 18px rgba(30, 122, 71, 0.18);
+        }
+
+        .toolbar button.secondary {
+            background: transparent;
+            color: var(--text);
+            box-shadow: none;
+        }
+
+        .toolbar button:hover:not(:disabled) {
+            transform: translateY(-1px);
+        }
+
+        .toolbar button:disabled {
+            opacity: 0.6;
+            cursor: progress;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-size: 0.88rem;
+            font-weight: 700;
+            border: 1px solid transparent;
+        }
+
+        .badge.success {
+            color: var(--accent);
+            background: var(--accent-soft);
+            border-color: rgba(30, 122, 71, 0.18);
+        }
+
+        .badge.warning {
+            color: var(--warning);
+            background: var(--warning-soft);
+            border-color: rgba(154, 107, 0, 0.18);
+        }
+
+        .badge.error {
+            color: var(--danger);
+            background: var(--danger-soft);
+            border-color: rgba(184, 69, 59, 0.18);
+        }
+
+        .badge.working {
+            color: #1f5b8b;
+            background: rgba(31, 91, 139, 0.12);
+            border-color: rgba(31, 91, 139, 0.18);
+        }
+
+        .status-line {
+            color: var(--muted);
+            font-size: 0.92rem;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(6, minmax(0, 1fr));
+            gap: 14px;
+            margin-bottom: 18px;
+        }
+
+        .summary-card {
+            padding: 16px 18px;
+        }
+
+        .summary-card .label {
+            display: block;
+            margin-bottom: 12px;
+            color: var(--muted);
+            font-size: 0.82rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-weight: 700;
+        }
+
+        .summary-card .value {
+            font-size: 1.55rem;
+            font-weight: 700;
+            line-height: 1.1;
+        }
+
+        .summary-card .subvalue {
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: 0.9rem;
+        }
+
+        .content-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.8fr) minmax(360px, 0.95fr);
+            gap: 18px;
+            margin-bottom: 18px;
+        }
+
+        .panel-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: flex-start;
+            margin-bottom: 14px;
+        }
+
+        .panel-body {
+            padding: 18px;
+        }
+
+        h2 {
+            margin: 0;
+            font-size: 1.2rem;
+        }
+
+        .panel-copy {
+            margin: 6px 0 0;
+            color: var(--muted);
+            font-size: 0.92rem;
+        }
+
+        .chart-wrap {
+            height: 420px;
+        }
+
+        .chart-wrap.compact {
+            height: 520px;
+        }
+
+        .table-shell {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th,
+        td {
+            padding: 12px 14px;
+            text-align: left;
+            border-bottom: 1px solid rgba(215, 224, 209, 0.95);
+            white-space: nowrap;
+        }
+
+        th {
+            color: var(--muted);
+            font-size: 0.84rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            font-weight: 700;
+        }
+
+        th.sortable {
             cursor: pointer;
             position: relative;
-            padding-right: 20px !important;
+            padding-right: 26px;
+            user-select: none;
         }
-        .sortable:hover {
-            background-color: #f0f0f0;
+
+        th.sortable:hover {
+            color: var(--text);
         }
+
         .sort-arrow {
             position: absolute;
-            right: 8px;
+            right: 10px;
             top: 50%;
             transform: translateY(-50%);
             width: 0;
             height: 0;
             border-left: 5px solid transparent;
             border-right: 5px solid transparent;
-            border-bottom: 5px solid #ccc;
+            border-bottom: 6px solid #b7c2b2;
             opacity: 0;
+            transition: opacity 0.15s ease;
         }
-        .sort-arrow.asc {
-            opacity: 1;
-        }
+
+        .sort-arrow.asc,
         .sort-arrow.desc {
             opacity: 1;
+        }
+
+        .sort-arrow.desc {
             border-bottom: none;
-            border-top: 5px solid #ccc;
+            border-top: 6px solid #7d8c7d;
         }
-        #charts {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 20px;
+
+        tbody tr:hover {
+            background: rgba(30, 122, 71, 0.04);
         }
-        #charts > div {
-            flex: 1;
-            min-width: 400px;
+
+        .muted {
+            color: var(--muted);
         }
-        /* анимация обновления  */
-        .refresh-indicator {
-            display: none;
+
+        .status-pill {
+            display: inline-flex;
             align-items: center;
             gap: 8px;
-            position: absolute;
-            margin-top: 10px;
-            color: #666;
-            font-size: 0.9em;
+            padding: 5px 10px;
+            border-radius: 999px;
+            font-size: 0.84rem;
+            font-weight: 700;
         }
 
-        .refresh-indicator.visible {
-            display: flex;
+        .status-pill.ok {
+            color: var(--accent);
+            background: var(--accent-soft);
         }
 
-        .refresh-indicator .spinner {
-            width: 16px;
-            height: 16px;
-            border: 2px solid rgba(0, 0, 0, 0.1);
-            border-radius: 50%;
-            border-top-color: #4CAF50;
-            animation: spin 1s linear infinite;
+        .status-pill.error {
+            color: var(--danger);
+            background: var(--danger-soft);
         }
 
-        @keyframes spin {
-            to { transform: rotate(360deg); }
+        .status-pill.unknown {
+            color: var(--warning);
+            background: var(--warning-soft);
         }
 
-        .summary-table table {
-            width: 100%;
-            border-collapse: collapse;
+        .status-message {
+            position: fixed;
+            right: 28px;
+            bottom: 28px;
+            min-width: 280px;
+            max-width: 420px;
+            padding: 14px 16px;
+            border-radius: 16px;
+            border: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.95);
+            box-shadow: var(--shadow);
+            color: var(--text);
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(12px);
+            transition: opacity 0.18s ease, transform 0.18s ease;
         }
-        .summary-table th, .summary-table td {
-            padding: 8px;
-            text-align: left;
-            border-bottom: 1px solid #ddd;
+
+        .status-message.visible {
+            opacity: 1;
+            transform: translateY(0);
         }
-        .summary-table th {
-            background-color: #e9ecef;
+
+        .status-message.success {
+            border-color: rgba(30, 122, 71, 0.18);
+        }
+
+        .status-message.error {
+            border-color: rgba(184, 69, 59, 0.18);
+        }
+
+        @media (max-width: 1240px) {
+            .summary-grid {
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+            }
+
+            .content-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 840px) {
+            body {
+                padding: 18px;
+            }
+
+            .page-header {
+                flex-direction: column;
+            }
+
+            .header-meta {
+                align-items: flex-start;
+            }
+
+            .summary-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .panel-body {
+                padding: 16px;
+            }
+
+            .chart-wrap,
+            .chart-wrap.compact {
+                height: 320px;
+            }
+        }
+
+        @media (max-width: 560px) {
+            .summary-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .toolbar {
+                padding: 14px;
+            }
+
+            th,
+            td {
+                padding: 10px 12px;
+            }
         }
     </style>
 </head>
 <body>
-    <h1>qBittorrent Monitoring</h1>
-    
-    <div class="refresh-controls">
-        <button id="refresh-btn">Обновить сейчас</button>
-        <label>
-            <input type="checkbox" id="auto-refresh"> 
-            Автообновление (каждые 5 минут)
-        </label>
-        <span class="last-update">Последнее обновление: <?= $current_data['last_update'] ?></span>
-        <!-- Добавьте этот элемент -->
-        <div id="refresh-indicator" class="refresh-indicator">
-            <div class="spinner"></div>
-            <span class="text">Обновление...</span>
-        </div>
-    </div>
-    
-    <div id="status" class="status"></div>
-    
-    <div id="charts">
-        <div>
-            <h2>Скорости по инстансам</h2>
-            <div class="chart-container">
-                <canvas id="historyChart"></canvas>
+    <div class="page">
+        <header class="page-header">
+            <div>
+                <p class="eyebrow">qBit Stats</p>
+                <h1>Категории в реальном времени</h1>
+                <p class="subtitle">Дашборд сам собирает свежий срез, пока открыт. Таймлайн нужен не для тултипов, а для мгновенного просмотра состава категорий в конкретный момент.</p>
             </div>
-        </div>
-        <div class="right_chart">
-            <h2>Статистика по категориям</h2>
-            <div class="chart-container">
-                <canvas id="categoryChart"></canvas>
+            <div class="header-meta">
+                <span id="refreshBadge" class="badge success">Срез актуален</span>
+                <span id="lastUpdateText" class="status-line">Последний срез: <?= htmlspecialchars($currentData['last_update'] ?? 'нет данных', ENT_QUOTES) ?></span>
             </div>
-        </div>
-    </div>
-    
-    <div class="summary-table">
-        <h3>Суммарная статистика по всем категориям</h3>
-        <table id="summaryTable">
-            <thead>
-                <tr>
-                    <th>Всего категорий</th>
-                    <th>Скорость загрузки</th>
-                    <th>Скорость отдачи</th>
-                    <th>Активные раздачи</th>
-                    <th>Общий объем</th>
-                    <th>Отдано за сеанс</th>
-                    <th>Всего отдано</th>
-                </tr>
-            </thead>
-            <tbody>
-                <tr>
-                    <td><?= count($current_data['categories']) ?></td>
-                    <td><?= format_speed(array_sum(array_column($current_data['categories'], 'dl_speed'))) ?></td>
-                    <td><?= format_speed(array_sum(array_column($current_data['categories'], 'up_speed'))) ?></td>
-                    <td><?= array_sum(array_column($current_data['categories'], 'active_torrents')) ?></td>
-                    <td><?= format_size(array_sum(array_column($current_data['categories'], 'total_size'))) ?></td>
-                    <td><?= format_size(array_sum(array_column($current_data['categories'], 'uploaded_session'))) ?></td>
-                    <td><?= format_size(array_sum(array_column($current_data['categories'], 'uploaded_total'))) ?></td>
-                </tr>
-            </tbody>
-        </table>
+        </header>
+
+        <section class="toolbar panel">
+            <div class="toolbar-group">
+                <button id="refreshButton" type="button">Обновить сейчас</button>
+                <label>
+                    <input id="autoRefreshCheckbox" type="checkbox" checked>
+                    Поддерживать дашборд свежим
+                </label>
+                <label>
+                    История
+                    <select id="historyHoursSelect">
+                        <?php foreach ($historyOptions as $option): ?>
+                            <option value="<?= $option ?>"<?= $option === $defaultHistoryHours ? ' selected' : '' ?>><?= $option ?> ч</option>
+                        <?php endforeach; ?>
+                    </select>
+                </label>
+            </div>
+            <div class="toolbar-group">
+                <span id="selectionStatus" class="badge warning">Просмотр: сейчас</span>
+                <button id="clearSelectionButton" type="button" class="secondary" hidden>Вернуться к текущему</button>
+            </div>
+        </section>
+
+        <section class="summary-grid">
+            <article class="summary-card panel">
+                <span class="label">Режим просмотра</span>
+                <div id="selectionModeValue" class="value">Сейчас</div>
+                <div id="selectionModeSubvalue" class="subvalue">Последний успешный срез</div>
+            </article>
+            <article class="summary-card panel">
+                <span class="label">Категории</span>
+                <div id="categoriesCountValue" class="value"><?= $categoryTotals['count'] ?></div>
+                <div class="subvalue">В выбранном срезе</div>
+            </article>
+            <article class="summary-card panel">
+                <span class="label">Upload</span>
+                <div id="uploadTotalValue" class="value"><?= format_speed($categoryTotals['up_speed']) ?></div>
+                <div class="subvalue">Суммарно по категориям</div>
+            </article>
+            <article class="summary-card panel">
+                <span class="label">Download</span>
+                <div id="downloadTotalValue" class="value"><?= format_speed($categoryTotals['dl_speed']) ?></div>
+                <div class="subvalue">Суммарно по категориям</div>
+            </article>
+            <article class="summary-card panel">
+                <span class="label">Активные торренты</span>
+                <div id="activeTorrentsValue" class="value"><?= $categoryTotals['active_torrents'] ?></div>
+                <div class="subvalue">По выбранному срезу</div>
+            </article>
+            <article class="summary-card panel">
+                <span class="label">Инстансы</span>
+                <div id="instancesHealthValue" class="value"><?= (int)$currentData['meta']['ok_count'] ?>/<?= (int)$currentData['meta']['instance_count'] ?></div>
+                <div id="instancesHealthSubvalue" class="subvalue">ошибок: <?= (int)$currentData['meta']['error_count'] ?></div>
+            </article>
+        </section>
+
+        <section class="content-grid">
+            <article class="panel">
+                <div class="panel-body">
+                    <div class="panel-head">
+                        <div>
+                            <h2>Таймлайн скоростей по инстансам</h2>
+                            <p class="panel-copy">Наведи курсор, чтобы моментально подменить таблицу категорий. Клик фиксирует момент до ручного сброса.</p>
+                        </div>
+                    </div>
+                    <div class="chart-wrap">
+                        <canvas id="historyChart"></canvas>
+                    </div>
+                </div>
+            </article>
+
+            <article class="panel">
+                <div class="panel-body">
+                    <div class="panel-head">
+                        <div>
+                            <h2>Текущий топ категорий</h2>
+                            <p class="panel-copy">Барчарт всегда показывает тот же срез, что и таблица ниже.</p>
+                        </div>
+                    </div>
+                    <div class="chart-wrap compact">
+                        <canvas id="categoryChart"></canvas>
+                    </div>
+                </div>
+            </article>
+        </section>
+
+        <section class="panel" style="margin-bottom: 18px;">
+            <div class="panel-body">
+                <div class="panel-head">
+                    <div>
+                        <h2 id="categoriesTitle">Категории: сейчас</h2>
+                        <p id="categoriesCaption" class="panel-copy">Наведение не меняет текущий срез навсегда: клик фиксирует, уход курсора возвращает live-вид.</p>
+                    </div>
+                </div>
+                <div class="table-shell">
+                    <table id="categoriesTable">
+                        <thead>
+                            <tr>
+                                <th class="sortable" data-column="category">Категория <span class="sort-arrow"></span></th>
+                                <th class="sortable" data-column="up_speed">Upload <span class="sort-arrow"></span></th>
+                                <th class="sortable" data-column="dl_speed">Download <span class="sort-arrow"></span></th>
+                                <th class="sortable" data-column="active_torrents">Активные <span class="sort-arrow"></span></th>
+                                <th class="sortable" data-column="total_size">Размер <span class="sort-arrow"></span></th>
+                                <th class="sortable" data-column="uploaded_session">За сеанс <span class="sort-arrow"></span></th>
+                                <th class="sortable" data-column="uploaded_total">Всего <span class="sort-arrow"></span></th>
+                                <th class="sortable" data-column="instances">Инстансы <span class="sort-arrow"></span></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($currentData['categories'] as $category): ?>
+                                <tr>
+                                    <td><?= htmlspecialchars($category['category'], ENT_QUOTES) ?></td>
+                                    <td><?= format_speed((int)$category['up_speed']) ?></td>
+                                    <td><?= format_speed((int)$category['dl_speed']) ?></td>
+                                    <td><?= (int)$category['active_torrents'] ?></td>
+                                    <td><?= format_size((int)$category['total_size']) ?></td>
+                                    <td><?= format_size((int)$category['uploaded_session']) ?></td>
+                                    <td><?= format_size((int)$category['uploaded_total']) ?></td>
+                                    <td class="muted"><?= htmlspecialchars($category['instances'] ?? '', ENT_QUOTES) ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-body">
+                <div class="panel-head">
+                    <div>
+                        <h2>Состояние инстансов</h2>
+                        <p class="panel-copy">Этот блок диагностический: категории важнее, но здесь видно, кто дал срез, а кто выпал.</p>
+                    </div>
+                </div>
+                <div class="table-shell">
+                    <table id="instancesTable">
+                        <thead>
+                            <tr>
+                                <th>Инстанс</th>
+                                <th>Статус</th>
+                                <th>Upload</th>
+                                <th>Download</th>
+                                <th>Последний успех</th>
+                                <th>Последняя ошибка</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($currentData['instances'] as $instance): ?>
+                                <tr>
+                                    <td><?= htmlspecialchars($instance['name'], ENT_QUOTES) ?></td>
+                                    <td>
+                                        <span class="status-pill <?= htmlspecialchars($instance['status'] ?? 'unknown', ENT_QUOTES) ?>">
+                                            <?= htmlspecialchars($instance['status'] ?? 'unknown', ENT_QUOTES) ?>
+                                        </span>
+                                    </td>
+                                    <td><?= format_speed((int)($instance['up_speed'] ?? 0)) ?></td>
+                                    <td><?= format_speed((int)($instance['dl_speed'] ?? 0)) ?></td>
+                                    <td class="muted"><?= htmlspecialchars($instance['last_success'] ?? 'нет данных', ENT_QUOTES) ?></td>
+                                    <td class="muted"><?= htmlspecialchars($instance['last_error'] ?? '—', ENT_QUOTES) ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
     </div>
 
-    <div class="category-table">
-        <h3>Детализация по категориям</h3>
-        <table id="categoriesTable">
-            <thead>
-                <tr>
-                    <th class="sortable" data-column="category">Категория <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-column="dl_speed">Скорость загрузки <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-column="up_speed">Скорость отдачи <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-column="active_torrents">Активные раздачи <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-column="total_size">Общий объем <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-column="uploaded_session">Отдано за сеанс <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-column="uploaded_total">Всего отдано <span class="sort-arrow"></span></th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php foreach ($current_data['categories'] as $category): ?>
-                <tr>
-                    <td><?= htmlspecialchars($category['category']) ?></td>
-                    <td data-sort-value="<?= $category['dl_speed'] ?>"><?= format_speed($category['dl_speed']) ?></td>
-                    <td data-sort-value="<?= $category['up_speed'] ?>"><?= format_speed($category['up_speed']) ?></td>
-                    <td data-sort-value="<?= $category['active_torrents'] ?>"><?= $category['active_torrents'] ?></td>
-                    <td data-sort-value="<?= $category['total_size'] ?? 0 ?>"><?= format_size($category['total_size'] ?? 0) ?></td>
-                    <td data-sort-value="<?= $category['uploaded_session'] ?? 0 ?>"><?= format_size($category['uploaded_session'] ?? 0) ?></td>
-                    <td data-sort-value="<?= $category['uploaded_total'] ?? 0 ?>"><?= format_size($category['uploaded_total'] ?? 0) ?></td>
-                </tr>
-                <?php endforeach; ?>
-            </tbody>
-        </table>
-    </div>
-    
+    <div id="statusMessage" class="status-message"></div>
+
     <script>
-        // Глобальные переменные для хранения экземпляров графиков
-        let historyChartInstance;
-        let categoryChartInstance;
-        let currentData = <?= json_encode($current_data) ?>;
-        let historyData = <?= json_encode($history_data) ?> || [];
-        let instances = <?= json_encode(array_column($config['instances'], 'name')) ?>;
-        
-        // Функция для экранирования HTML
-        function escapeHtml(unsafe) {
-            return unsafe
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;")
-                .replace(/"/g, "&quot;")
-                .replace(/'/g, "&#039;");
+        const currentDataSeed = <?= json_for_script($currentData) ?>;
+        const historyPayloadSeed = <?= json_for_script($historyData) ?>;
+        const instanceNames = <?= json_for_script(array_column($config['instances'], 'name')) ?>;
+
+        let currentData = currentDataSeed;
+        let historyPayload = historyPayloadSeed;
+        let selectedHistoryHours = historyPayload.hours || currentData.meta.history_hours_default;
+        let historyChartInstance = null;
+        let categoryChartInstance = null;
+        let autoRefreshTimer = null;
+        let isRefreshing = false;
+        let bootRefreshScheduled = false;
+        let hoveredTimestamp = null;
+        let pinnedTimestamp = null;
+        let previewAbortController = null;
+        let categorySortState = loadCategorySortState();
+
+        const categoryCache = new Map();
+        if (currentData.last_update) {
+            categoryCache.set(currentData.last_update, currentData.categories);
         }
-        
-        // Функция форматирования скорости для tooltip
-        function formatSpeedTooltip(bytes) {
-            const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-            bytes = Math.abs(bytes);
-            if (bytes === 0) return '0 B/s';
-            const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-            return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
+
+        const pollIntervalMs = Math.max(30000, (currentData.meta.refresh_ttl_seconds || 60) * 1000);
+
+        function formatSpeed(bytes) {
+            const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
+            const value = Math.max(Number(bytes) || 0, 0);
+            if (value === 0) {
+                return '0 B/s';
+            }
+
+            const power = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+            return `${(value / Math.pow(1024, power)).toFixed(2)} ${units[power]}`;
         }
-        
-        // Функция форматирования размера для tooltip
-        function formatSizeTooltip(bytes) {
+
+        function formatSize(bytes) {
             const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-            bytes = Math.abs(bytes);
-            if (bytes === 0) return '0 B';
-            const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-            return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
-        }
-        
-        // Функция сортировки таблицы
-        function sortTable(table, column, direction) {
-            const tbody = table.querySelector('tbody');
-            const rows = Array.from(tbody.querySelectorAll('tr'));
-            
-            rows.sort((a, b) => {
-                let aValue, bValue;
-                
-                if (column === 'category') {
-                    aValue = a.cells[0].textContent.trim();
-                    bValue = b.cells[0].textContent.trim();
-                    return direction === 'asc' 
-                        ? aValue.localeCompare(bValue) 
-                        : bValue.localeCompare(aValue);
-                } else {
-                    const colIndex = Array.from(table.querySelectorAll('th')).findIndex(th => th.dataset.column === column);
-                    aValue = parseFloat(a.cells[colIndex].getAttribute('data-sort-value')) || 0;
-                    bValue = parseFloat(b.cells[colIndex].getAttribute('data-sort-value')) || 0;
-                    return direction === 'asc' ? aValue - bValue : bValue - aValue;
-                }
-            });
-            
-            // Удаляем существующие строки
-            while (tbody.firstChild) {
-                tbody.removeChild(tbody.firstChild);
+            const value = Math.max(Number(bytes) || 0, 0);
+            if (value === 0) {
+                return '0 B';
             }
-            
-            // Добавляем отсортированные строки
-            rows.forEach(row => tbody.appendChild(row));
-            
-            // Обновляем индикаторы сортировки
-            table.querySelectorAll('.sort-arrow').forEach(arrow => {
-                arrow.classList.remove('asc', 'desc');
-            });
-            
-            const header = table.querySelector(`th[data-column="${column}"]`);
-            if (header) {
-                const arrow = header.querySelector('.sort-arrow');
-                if (arrow) {
-                    arrow.classList.add(direction);
-                }
-            }
+
+            const power = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+            return `${(value / Math.pow(1024, power)).toFixed(2)} ${units[power]}`;
         }
 
-        // Функция для обновления сводной таблицы
-        function updateSummaryTable(categories) {
-            const totalCategories = categories.length;
-            const totalDlSpeed = categories.reduce((sum, cat) => sum + (cat.dl_speed || 0), 0);
-            const totalUpSpeed = categories.reduce((sum, cat) => sum + (cat.up_speed || 0), 0);
-            const totalActive = categories.reduce((sum, cat) => sum + (cat.active_torrents || 0), 0);
-            const totalSize = categories.reduce((sum, cat) => sum + (cat.total_size || 0), 0);
-            const totalUploaded = categories.reduce((sum, cat) => sum + (cat.uploaded_session || 0), 0);
-            const totalUploadedTotal = categories.reduce((sum, cat) => sum + (cat.uploaded_total || 0), 0);
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
 
-            const summaryTable = document.getElementById('summaryTable');
-            if (summaryTable) {
-                summaryTable.querySelector('tbody').innerHTML = `
-                    <tr>
-                        <td>${totalCategories}</td>
-                        <td>${formatSpeedTooltip(totalDlSpeed)}</td>
-                        <td>${formatSpeedTooltip(totalUpSpeed)}</td>
-                        <td>${totalActive}</td>
-                        <td>${formatSizeTooltip(totalSize)}</td>
-                        <td>${formatSizeTooltip(totalUploaded)}</td>
-                        <td>${formatSizeTooltip(totalUploadedTotal)}</td>
-                    </tr>
-                `;
+        function formatTimestamp(timestamp) {
+            if (!timestamp) {
+                return 'нет данных';
             }
-        }
-        
-        // Функция обновления таблицы категорий
-        function updateCategoriesTable(categories) {
-            const tbody = document.querySelector('#categoriesTable tbody');
-            tbody.innerHTML = categories.map(category => `
-                <tr>
-                    <td>${escapeHtml(category.category)}</td>
-                    <td data-sort-value="${category.dl_speed}">${formatSpeedTooltip(category.dl_speed)}</td>
-                    <td data-sort-value="${category.up_speed}">${formatSpeedTooltip(category.up_speed)}</td>
-                    <td data-sort-value="${category.active_torrents}">${category.active_torrents}</td>
-                    <td data-sort-value="${category.total_size || 0}">${formatSizeTooltip(category.total_size || 0)}</td>
-                    <td data-sort-value="${category.uploaded_session || 0}">${formatSizeTooltip(category.uploaded_session || 0)}</td>
-                    <td data-sort-value="${category.uploaded_total || 0}">${formatSizeTooltip(category.uploaded_total || 0)}</td>
-                </tr>
-            `).join('');
-            
-            // Восстанавливаем сортировку, если она была
-            const savedSort = localStorage.getItem('categoriesTableSort');
-            if (savedSort) {
-                try {
-                    const { column, direction } = JSON.parse(savedSort);
-                    sortTable(document.getElementById('categoriesTable'), column, direction);
-                } catch (e) {
-                    console.error('Error loading sort state:', e);
-                }
-            }
-        }
-        
-        // Функция инициализации графика категорий
-        function initCategoryChart(categories) {
-            const ctx = document.getElementById('categoryChart').getContext('2d');
-            
-            if (categoryChartInstance) {
-                categoryChartInstance.data.labels = categories.map(c => c.category);
-                categoryChartInstance.data.datasets[0].data = categories.map(c => c.up_speed);
-                categoryChartInstance.update();
-            } else {
-                categoryChartInstance = new Chart(ctx, {
-                    type: 'bar',
-                    data: {
-                        labels: categories.map(c => c.category),
-                        datasets: [{
-                            label: 'Upload Speed',
-                            data: categories.map(c => c.up_speed),
-                            backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                            borderColor: 'rgba(75, 192, 192, 1)',
-                            borderWidth: 2
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        scales: {
-                            y: {
-                                beginAtZero: true,
-                                ticks: {
-                                    callback: function(value) {
-                                        return formatSpeedTooltip(value);
-                                    }
-                                }
-                            }
-                        },
-                        plugins: {
-                            tooltip: {
-                                callbacks: {
-                                    label: function(context) {
-                                        return `${context.dataset.label}: ${formatSpeedTooltip(context.raw)}`;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        }
-        
-        // Функция инициализации графика истории
-        function initHistoryChart(data = historyData) {
-            const ctx = document.getElementById('historyChart').getContext('2d');
-            
-            // Если график уже существует - просто обновляем данные
-            if (historyChartInstance) {
-                updateHistoryChart(data);
-                return;
-            }
-            
-            // Группировка данных по времени
-            const timestamps = [...new Set(historyData.map(item => item.timestamp))].sort();
-            
-            // Создаем наборы данных для каждого инстанса (Download)
-            const dlDatasets = instances.map(instance => {
-                return {
-                    label: `${instance} ↓ Download`,
-                    data: timestamps.map(time => {
-                        const record = historyData.find(item => 
-                            item.instance_name === instance && item.timestamp === time);
-                        return record ? record.dl_speed : 0;
-                    }),
-                    backgroundColor: getRandomColor(instance, 1),
-                    borderColor: getRandomColor(instance, 1),
-                    borderWidth: 1,
-                    fill: true,
-                    tension: 0.4,
-                    stack: 'download'
-                };
-            });
-            
-            // Создаем наборы данных для каждого инстанса (Upload)
-            const upDatasets = instances.map(instance => {
-                return {
-                    label: `${instance} ↑ Upload`,
-                    data: timestamps.map(time => {
-                        const record = historyData.find(item => 
-                            item.instance_name === instance && item.timestamp === time);
-                        return record ? record.up_speed : 0;
-                    }),
-                    backgroundColor: getRandomColor(instance, 0.2),
-                    borderColor: getRandomColor(instance, 0.5),
-                    borderWidth: 1,
-                    fill: true,
-                    tension: 0.4,
-                    stack: 'upload'
-                };
-            });
-            
-            // Функция для генерации цветов
-            function getRandomColor(base, opacity) {
-                const hash = [...base].reduce((acc, char) => char.charCodeAt(0) + acc, 0);
-                const r = (hash * 13) % 255;
-                const g = (hash * 25) % 255;
-                const b = (hash * 38) % 255;
-                return `rgba(${r}, ${g}, ${b}, ${opacity})`;
-            }
-            
-            historyChartInstance = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: timestamps.map(time => new Date(time).toLocaleTimeString()),
-                    datasets: [...dlDatasets, ...upDatasets]
-                },
-                options: {
-                    responsive: true,
-                    interaction: {
-                        intersect: false,
-                        mode: 'index'
-                    },
-                    scales: {
-                        x: {
-                            stacked: true,
-                            title: { display: true, text: 'Time' },
-                            grid: {
-                                display: false
-                            }
-                        },
-                        y: {
-                            stacked: true,
-                            beginAtZero: true,
-                            title: { display: true, text: 'Speed (B/s)' },
-                            ticks: {
-                                callback: function(value) {
-                                    return formatSpeedTooltip(value);
-                                }
-                            }
-                        }
-                    },
-                    plugins: {
-                        title: {
-                            display: true,
-                            text: 'История скоростей (Stacked Area Chart)'
-                        },
-                        tooltip: {
-                            callbacks: {
-                                label: function(context) {
-                                    return `${context.dataset.label}: ${formatSpeedTooltip(context.raw)}`;
-                                },
-                                footer: function(tooltipItems) {
-                                    let dlTotal = 0;
-                                    let upTotal = 0;
-                                    
-                                    tooltipItems.forEach(item => {
-                                        if (item.dataset.stack === 'download') {
-                                            dlTotal += item.raw;
-                                        } else {
-                                            upTotal += item.raw;
-                                        }
-                                    });
-                                    
-                                    return [
-                                        `Total Download: ${formatSpeedTooltip(dlTotal)}`,
-                                        `Total Upload: ${formatSpeedTooltip(upTotal)}`
-                                    ];
-                                }
-                            }
-                        },
-                        legend: {
-                            position: 'top',
-                            labels: {
-                                boxWidth: 12,
-                                usePointStyle: true
-                            }
-                        }
-                    },
-                    elements: {
-                        point: {
-                            radius: 0,
-                            hoverRadius: 5
-                        }
-                    }
-                }
-            });
-            
-            // Добавляем обработчик событий мыши
-            let lastProcessedTimestamp = null;
-            let activeRequestController = null;
-            const responseCache = {};
 
-            // Обновляем глобальную переменную historyData при получении новых данных
-            window.updateHistoryData = function(newData) {
-                historyData = newData;
-                
-                // Также обновляем кэш для уже загруженных точек
-                Object.keys(responseCache).forEach(timestamp => {
-                    if (!newData.some(item => item.timestamp === timestamp)) {
-                        // Удаляем устаревшие данные из кэша
-                        delete responseCache[timestamp];
-                    }
-                });
+            const date = new Date(timestamp.replace(' ', 'T'));
+            if (Number.isNaN(date.getTime())) {
+                return timestamp;
+            }
+
+            return date.toLocaleString('ru-RU', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+            });
+        }
+
+        function formatTimeLabel(timestamp) {
+            if (!timestamp) {
+                return '';
+            }
+
+            const date = new Date(timestamp.replace(' ', 'T'));
+            if (Number.isNaN(date.getTime())) {
+                return timestamp;
+            }
+
+            return date.toLocaleTimeString('ru-RU', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+            });
+        }
+
+        function getStatusClass(status) {
+            if (status === 'ok') {
+                return 'ok';
+            }
+
+            if (status === 'error') {
+                return 'error';
+            }
+
+            return 'unknown';
+        }
+
+        function makeColor(seed, alpha) {
+            let hash = 0;
+            for (const char of seed) {
+                hash = ((hash << 5) - hash) + char.charCodeAt(0);
+                hash |= 0;
+            }
+
+            const red = Math.abs((hash * 53) % 200) + 20;
+            const green = Math.abs((hash * 97) % 180) + 30;
+            const blue = Math.abs((hash * 131) % 160) + 40;
+
+            return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+        }
+
+        function computeCategoryTotals(categories) {
+            return categories.reduce((totals, category) => {
+                totals.count += 1;
+                totals.upSpeed += Number(category.up_speed) || 0;
+                totals.dlSpeed += Number(category.dl_speed) || 0;
+                totals.activeTorrents += Number(category.active_torrents) || 0;
+                return totals;
+            }, { count: 0, upSpeed: 0, dlSpeed: 0, activeTorrents: 0 });
+        }
+
+        function getDefaultCategorySortState() {
+            return {
+                column: 'up_speed',
+                direction: 'desc',
             };
+        }
 
-            // Функция для обработки наведения на график
-            const handleChartHover = async (e) => {
-                if (!historyChartInstance) return;
-                
-                const points = historyChartInstance.getElementsAtEventForMode(e, 'nearest', { intersect: false }, true);
-                if (points.length === 0) return;
-                
-                const pointIndex = points[0].index;
-                const currentLabel = historyChartInstance.data.labels[pointIndex];
-                
-                // Находим полный timestamp по метке времени
-                const originalDataPoint = historyData.find(item => 
-                    new Date(item.timestamp).toLocaleTimeString() === currentLabel
-                );
-                
-                if (!originalDataPoint || !originalDataPoint.timestamp) return;
-                
-                const currentTimestamp = originalDataPoint.timestamp;
-                
-                // Если timestamp не изменился - ничего не делаем
-                if (lastProcessedTimestamp === currentTimestamp) return;
-                
-                lastProcessedTimestamp = currentTimestamp;
-                
-                // Проверяем кэш
-                if (responseCache[currentTimestamp]) {
-                    updateCategoriesTable(responseCache[currentTimestamp]);
-                    updateSummaryTable(responseCache[currentTimestamp]); // Добавим эту строку
-                    initCategoryChart(responseCache[currentTimestamp]);
+        function loadCategorySortState() {
+            const fallback = getDefaultCategorySortState();
+            const raw = localStorage.getItem('qbitStatsCategorySort');
+            if (!raw) {
+                return fallback;
+            }
+
+            try {
+                const parsed = JSON.parse(raw);
+                if (!parsed || typeof parsed.column !== 'string' || !['asc', 'desc'].includes(parsed.direction)) {
+                    return fallback;
+                }
+
+                return parsed;
+            } catch (error) {
+                return fallback;
+            }
+        }
+
+        function saveCategorySortState() {
+            localStorage.setItem('qbitStatsCategorySort', JSON.stringify(categorySortState));
+        }
+
+        function sortCategories(categories) {
+            const sorted = [...categories];
+            const { column, direction } = categorySortState;
+
+            sorted.sort((left, right) => {
+                let result = 0;
+
+                if (column === 'category' || column === 'instances') {
+                    result = String(left[column] || '').localeCompare(String(right[column] || ''), 'ru');
+                } else {
+                    result = (Number(left[column]) || 0) - (Number(right[column]) || 0);
+                }
+
+                if (result === 0 && column !== 'category') {
+                    result = String(left.category || '').localeCompare(String(right.category || ''), 'ru');
+                }
+
+                return direction === 'asc' ? result : -result;
+            });
+
+            return sorted;
+        }
+
+        function updateCategorySortIndicators() {
+            document.querySelectorAll('#categoriesTable thead th.sortable').forEach(header => {
+                const arrow = header.querySelector('.sort-arrow');
+                if (!arrow) {
                     return;
                 }
-                
-                // Отменяем предыдущий запрос, если он есть
-                if (activeRequestController) {
-                    activeRequestController.abort();
-                }
-                activeRequestController = new AbortController();
-                
-                try {
-                    const response = await fetch(`get_category_history.php?timestamp=${encodeURIComponent(currentTimestamp)}`, {
-                        signal: activeRequestController.signal
-                    });
-                    
-                    if (!response.ok) throw new Error('Network error');
-                    
-                    const historicalData = await response.json();
-                    
-                    // Сохраняем в кэш
-                    responseCache[currentTimestamp] = historicalData;
-                    
-                    updateCategoriesTable(historicalData);
-                    initCategoryChart(historicalData);
-                    updateSummaryTable(historicalData); // Добавим эту строку
-                    
-                } catch (error) {
-                    if (error.name !== 'AbortError') {
-                        console.error('Error fetching historical data:', error);
-                        updateCategoriesTable(currentData.categories);
-                        initCategoryChart(currentData.categories);
-                        updateSummaryTable(currentData.categories); // Добавим эту строку
-                    }
-                } finally {
-                    activeRequestController = null;
-                }
-            };
 
-            // Добавьте обработчики событий
-            document.getElementById('historyChart').addEventListener('mousemove', (e) => {
-                if (!historyChartInstance) return;
-                
-                const points = historyChartInstance.getElementsAtEventForMode(e, 'nearest', { intersect: false }, true);
-                if (points.length === 0) return;
-                
-                const pointIndex = points[0].index;
-                const currentLabel = historyChartInstance.data.labels[pointIndex];
-                
-                // Находим полный timestamp для этой точки
-                const originalDataPoint = historyData.find(item => 
-                    new Date(item.timestamp).toLocaleTimeString() === currentLabel
-                );
-                
-                // Обновляем заголовки только если нашли timestamp
-                if (originalDataPoint?.timestamp) {
-                    const date = new Date(originalDataPoint.timestamp);
-                    const timeStr = `${date.getFullYear()}-${(date.getMonth()+1).toString().padStart(2,'0')}-${date.getDate().toString().padStart(2,'0')} ${date.getHours().toString().padStart(2,'0')}:${date.getMinutes().toString().padStart(2,'0')}:${date.getSeconds().toString().padStart(2,'0')}`;
-                    
-                    document.querySelector('.category-table h3').textContent = `Детализация по категориям (${timeStr})`;
-                    document.querySelector('#charts .right_chart h2').textContent = `Статистика по категориям (${timeStr})`;
+                arrow.classList.remove('asc', 'desc');
+                if (header.dataset.column === categorySortState.column) {
+                    arrow.classList.add(categorySortState.direction);
                 }
-                
-                // Вызываем ваш основной обработчик
-                handleChartHover(e);
-            });
-            document.getElementById('historyChart').addEventListener('mouseleave', () => {
-                // Возвращаем заголовки без времени
-                document.querySelector('.category-table h3').textContent = 'Детализация по категориям';
-                document.querySelector('#charts .right_chart h2').textContent = 'Статистика по категориям';
-                
-                // Дополнительно вызываем ваш handleChartHover если нужно
-                if (typeof handleChartHover === 'function') {
-                    // handleChartHover();
-                }
-            });
-            
-            // Восстанавливаем исходные данные при уходе курсора
-            document.getElementById('historyChart').addEventListener('mouseout', () => {
-                updateCategoriesTable(currentData.categories);
-                initCategoryChart(currentData.categories);
-                updateSummaryTable(currentData.categories); // Добавим эту строку
             });
         }
-        
-        // Инициализация при загрузке
-        $(document).ready(function() {
-            const status = $('#status');
-            const lastUpdate = $('.last-update');
-            const autoRefreshCheckbox = $('#auto-refresh');
-            let refreshInterval;
-            let isFirstLoad = true;
-            
-            // Загружаем состояние из localStorage
-            const savedAutoRefreshState = localStorage.getItem('autoRefreshEnabled');
-            if (savedAutoRefreshState !== null) {
-                autoRefreshCheckbox.prop('checked', savedAutoRefreshState === 'true');
-            }
-            
-            function updateStatus(message, type) {
-                status.removeClass('loading success error')
-                      .addClass(type)
-                      .text(message)
-                      .fadeIn().delay(3000).fadeOut();
-            }
-            
-            // Функция для обновления данных
-            let lastKnownUpdate = '<?= $current_data["last_update"] ?>'; // Инициализируем текущим временем
 
-            async function refreshData() {
-                const indicator = document.getElementById('refresh-indicator');
-                if (!indicator) return;
+        function buildHistoryModel(items) {
+            const timestamps = [...new Set(items.map(item => item.timestamp))].sort();
+            const labels = timestamps.map(formatTimeLabel);
 
-                try {
-                    indicator.classList.add('visible');
-                    
-                    // 1. Проверяем время последнего обновления с If-Modified-Since
-                    const timeCheck = await fetch('get_last_update.php', {
-                        headers: {
-                            'If-Modified-Since': lastKnownUpdate
-                        }
-                    });
-                    
-                    // Если данные не изменились (304) - выходим
-                    if (timeCheck.status === 304) {
-                        indicator.classList.remove('visible');
-                        return;
-                    }
-                    
-                    // Если данные изменились - получаем новый timestamp
-                    const { last_update } = await timeCheck.json();
-                    
-                    // 2. Загружаем ТОЛЬКО новые данные (с If-Modified-Since)
-                    const dataResponse = await fetch('get_current_data.php', {
-                        headers: {
-                            'If-Modified-Since': lastKnownUpdate
-                        }
-                    });
-                    
-                    // Если основные данные не изменились (304) - обновляем только историю
-                    if (dataResponse.status === 304) {
-                        const historyResponse = await fetch('get_history_data.php?hours=6');
-                        const newHistoryData = await historyResponse.json();
+            const downloadDatasets = instanceNames.map(instanceName => ({
+                label: `${instanceName} ↓ Download`,
+                data: timestamps.map(timestamp => {
+                    const row = items.find(item => item.instance_name === instanceName && item.timestamp === timestamp);
+                    return row ? Number(row.dl_speed) || 0 : 0;
+                }),
+                backgroundColor: makeColor(`${instanceName}-dl`, 0.16),
+                borderColor: makeColor(`${instanceName}-dl`, 0.78),
+                borderWidth: 1.4,
+                fill: true,
+                tension: 0.24,
+                stack: 'download',
+                pointRadius: 0,
+                pointHoverRadius: 4,
+            }));
 
-                        // Обновляем глобальные данные истории
-                        if (typeof updateHistoryData === 'function') {
-                            updateHistoryData(newHistoryData);
-                        }
+            const uploadDatasets = instanceNames.map(instanceName => ({
+                label: `${instanceName} ↑ Upload`,
+                data: timestamps.map(timestamp => {
+                    const row = items.find(item => item.instance_name === instanceName && item.timestamp === timestamp);
+                    return row ? Number(row.up_speed) || 0 : 0;
+                }),
+                backgroundColor: makeColor(`${instanceName}-up`, 0.08),
+                borderColor: makeColor(`${instanceName}-up`, 0.48),
+                borderWidth: 1.1,
+                fill: true,
+                tension: 0.24,
+                stack: 'upload',
+                pointRadius: 0,
+                pointHoverRadius: 4,
+                borderDash: [5, 4],
+            }));
 
-                        updateHistoryChart(newHistoryData);
-                    } 
-                    // Если данные изменились - обновляем всё
-                    else {
-                        const newData = await dataResponse.json();
-                        const historyResponse = await fetch('get_history_data.php?hours=6');
-                        const newHistoryData = await historyResponse.json();
+            return {
+                timestamps,
+                labels,
+                datasets: [...downloadDatasets, ...uploadDatasets],
+            };
+        }
 
-                        // Обновляем глобальные данные истории
-                        if (typeof updateHistoryData === 'function') {
-                            updateHistoryData(newHistoryData);
-                        }
-                        
-                        updateCategoriesTable(newData.categories);
-                        updateCategoryChart(newData.categories);
-                        updateHistoryChart(newHistoryData);
-                        updateSummaryTable(newData.categories);
-                        
-                        // Обновляем lastKnownUpdate
-                        lastKnownUpdate = newData.last_update;
-                        document.querySelector('.last-update').textContent = 
-                            `Последнее обновление: ${newData.last_update}`;
-                    }
-                    
-                } catch (error) {
-                    console.error('Ошибка:', error);
-                    // Обработка ошибок...
-                } finally {
-                    setTimeout(() => indicator.classList.remove('visible'), 1000);
-                }
-            }
+        function renderHistoryChart() {
+            const model = buildHistoryModel(historyPayload.data || []);
+            const context = document.getElementById('historyChart').getContext('2d');
 
-            // Функция для обновления графика категорий
-            function updateCategoryChart(categories) {
-                if (!categoryChartInstance) return;
-                
-                categoryChartInstance.data.labels = categories.map(c => c.category);
-                categoryChartInstance.data.datasets[0].data = categories.map(c => c.up_speed);
-                categoryChartInstance.update();
-            }
-            // Функция для обновления графика инстансов
-            function updateHistoryChart(newHistoryData) {
-                if (!historyChartInstance) return;
-                
-                // 1. Получаем уникальные timestamp'ы и сортируем их
-                const timestamps = [...new Set(newHistoryData.map(item => item.timestamp))].sort();
-                
-                // 2. Обновляем метки графика (ось X)
-                historyChartInstance.data.labels = timestamps.map(time => new Date(time).toLocaleTimeString());
-                
-                // 3. Обновляем данные для каждого датасета
-                historyChartInstance.data.datasets.forEach(dataset => {
-                    const instanceName = dataset.label.split(' ')[0];
-                    const isDownload = dataset.label.includes('Download');
-                    
-                    dataset.data = timestamps.map(time => {
-                        const record = newHistoryData.find(item => 
-                            item.instance_name === instanceName && 
-                            item.timestamp === time
-                        );
-                        return record ? (isDownload ? record.dl_speed : record.up_speed) : 0;
-                    });
+            if (!historyChartInstance) {
+                historyChartInstance = new Chart(context, {
+                    type: 'line',
+                    data: {
+                        labels: model.labels,
+                        datasets: model.datasets,
+                    },
+                    options: {
+                        maintainAspectRatio: false,
+                        responsive: true,
+                        interaction: {
+                            intersect: false,
+                            mode: 'index',
+                        },
+                        scales: {
+                            x: {
+                                stacked: true,
+                                grid: {
+                                    display: false,
+                                },
+                            },
+                            y: {
+                                stacked: true,
+                                beginAtZero: true,
+                                ticks: {
+                                    callback: value => formatSpeed(value),
+                                },
+                            },
+                        },
+                        plugins: {
+                            legend: {
+                                position: 'top',
+                                labels: {
+                                    boxWidth: 10,
+                                    usePointStyle: true,
+                                },
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false,
+                                callbacks: {
+                                    title: items => {
+                                        const timestamp = historyChartInstance?.$timestamps?.[items[0]?.dataIndex ?? -1];
+                                        return formatTimestamp(timestamp);
+                                    },
+                                    label: context => `${context.dataset.label}: ${formatSpeed(context.raw)}`,
+                                },
+                            },
+                        },
+                    },
                 });
-                
-                // 4. Обновляем график
+            } else {
+                historyChartInstance.data.labels = model.labels;
+                historyChartInstance.data.datasets = model.datasets;
                 historyChartInstance.update();
             }
 
-            // Запускаем проверку каждые 30 секунд
-            setInterval(refreshData, 30000);
+            historyChartInstance.$timestamps = model.timestamps;
+        }
 
-            // Инициализируем первый раз
-            refreshData();
-            
-            // Ручное обновление
-            $('#refresh-btn').click(function() {
-                isFirstLoad = false;
-                refreshData();
+        function renderCategoryChart(categories, options = {}) {
+            const animate = options.animate === true;
+            const context = document.getElementById('categoryChart').getContext('2d');
+            const topCategories = [...categories]
+                .sort((left, right) => (Number(right.up_speed) || 0) - (Number(left.up_speed) || 0))
+                .slice(0, 12);
+
+            const chartData = {
+                labels: topCategories.map(category => category.category),
+                datasets: [{
+                    label: 'Upload',
+                    data: topCategories.map(category => Number(category.up_speed) || 0),
+                    backgroundColor: topCategories.map(category => makeColor(category.category, 0.28)),
+                    borderColor: topCategories.map(category => makeColor(category.category, 0.92)),
+                    borderWidth: 1.4,
+                    borderRadius: 10,
+                    maxBarThickness: 22,
+                }],
+            };
+
+            if (!categoryChartInstance) {
+                categoryChartInstance = new Chart(context, {
+                    type: 'bar',
+                    data: chartData,
+                    options: {
+                        indexAxis: 'y',
+                        maintainAspectRatio: false,
+                        responsive: true,
+                        scales: {
+                            x: {
+                                beginAtZero: true,
+                                ticks: {
+                                    callback: value => formatSpeed(value),
+                                },
+                            },
+                            y: {
+                                grid: {
+                                    display: false,
+                                },
+                            },
+                        },
+                        plugins: {
+                            legend: {
+                                display: false,
+                            },
+                            tooltip: {
+                                callbacks: {
+                                    label: context => formatSpeed(context.raw),
+                                },
+                            },
+                        },
+                    },
+                });
+            } else {
+                categoryChartInstance.data = chartData;
+                categoryChartInstance.update(animate ? undefined : 'none');
+            }
+        }
+
+        function renderCategoriesTable(categories) {
+            const tbody = document.querySelector('#categoriesTable tbody');
+            const sortedCategories = sortCategories(categories);
+            tbody.innerHTML = sortedCategories.map(category => `
+                <tr>
+                    <td>${escapeHtml(category.category)}</td>
+                    <td>${formatSpeed(category.up_speed)}</td>
+                    <td>${formatSpeed(category.dl_speed)}</td>
+                    <td>${Number(category.active_torrents) || 0}</td>
+                    <td>${formatSize(category.total_size)}</td>
+                    <td>${formatSize(category.uploaded_session)}</td>
+                    <td>${formatSize(category.uploaded_total)}</td>
+                    <td class="muted">${escapeHtml(category.instances || '')}</td>
+                </tr>
+            `).join('');
+            updateCategorySortIndicators();
+        }
+
+        function renderInstancesTable() {
+            const tbody = document.querySelector('#instancesTable tbody');
+            tbody.innerHTML = currentData.instances.map(instance => `
+                <tr>
+                    <td>${escapeHtml(instance.name)}</td>
+                    <td><span class="status-pill ${getStatusClass(instance.status)}">${escapeHtml(instance.status || 'unknown')}</span></td>
+                    <td>${formatSpeed(instance.up_speed)}</td>
+                    <td>${formatSpeed(instance.dl_speed)}</td>
+                    <td class="muted">${escapeHtml(instance.last_success || 'нет данных')}</td>
+                    <td class="muted">${escapeHtml(instance.last_error || '—')}</td>
+                </tr>
+            `).join('');
+        }
+
+        function updateSelectionCards(mode, timestamp) {
+            const titleMap = {
+                live: 'Сейчас',
+                hover: 'Предпросмотр',
+                pinned: 'Фиксация',
+            };
+
+            document.getElementById('selectionModeValue').textContent = titleMap[mode] || 'Сейчас';
+            document.getElementById('selectionModeSubvalue').textContent = mode === 'live'
+                ? 'Последний успешный срез'
+                : formatTimestamp(timestamp);
+        }
+
+        function updateCategoryMetrics(categories) {
+            const totals = computeCategoryTotals(categories);
+            document.getElementById('categoriesCountValue').textContent = totals.count;
+            document.getElementById('uploadTotalValue').textContent = formatSpeed(totals.upSpeed);
+            document.getElementById('downloadTotalValue').textContent = formatSpeed(totals.dlSpeed);
+            document.getElementById('activeTorrentsValue').textContent = totals.activeTorrents;
+        }
+
+        function updateInstancesHealth() {
+            document.getElementById('instancesHealthValue').textContent = `${currentData.meta.ok_count}/${currentData.meta.instance_count}`;
+            document.getElementById('instancesHealthSubvalue').textContent = `ошибок: ${currentData.meta.error_count}`;
+        }
+
+        function updateRefreshStatus() {
+            const refreshMeta = currentData.meta.refresh || {};
+            const badge = document.getElementById('refreshBadge');
+            const lastUpdate = currentData.last_update ? formatTimestamp(currentData.last_update) : 'нет данных';
+
+            let text = 'Срез актуален';
+            let badgeClass = 'success';
+
+            if (refreshMeta.in_progress) {
+                text = 'Идёт обновление';
+                badgeClass = 'working';
+            } else if (refreshMeta.error) {
+                text = 'Последний refresh с ошибкой';
+                badgeClass = 'error';
+            } else if (refreshMeta.summary?.status === 'partial' || currentData.meta.error_count > 0) {
+                text = 'Часть инстансов не ответила';
+                badgeClass = 'warning';
+            } else if (currentData.meta.is_stale) {
+                text = 'Срез устарел';
+                badgeClass = 'warning';
+            }
+
+            badge.className = `badge ${badgeClass}`;
+            badge.textContent = text;
+            document.getElementById('lastUpdateText').textContent = `Последний срез: ${lastUpdate}`;
+        }
+
+        function setRefreshBadge(text, badgeClass) {
+            const badge = document.getElementById('refreshBadge');
+            badge.className = `badge ${badgeClass}`;
+            badge.textContent = text;
+        }
+
+        function updateSelectionBadge(mode, timestamp) {
+            const badge = document.getElementById('selectionStatus');
+            const clearButton = document.getElementById('clearSelectionButton');
+
+            if (mode === 'pinned') {
+                badge.className = 'badge success';
+                badge.textContent = `Просмотр: фиксированный срез ${formatTimestamp(timestamp)}`;
+                clearButton.hidden = false;
+            } else if (mode === 'hover') {
+                badge.className = 'badge warning';
+                badge.textContent = `Просмотр: предпросмотр ${formatTimestamp(timestamp)}`;
+                clearButton.hidden = true;
+            } else {
+                badge.className = 'badge warning';
+                badge.textContent = 'Просмотр: сейчас';
+                clearButton.hidden = true;
+            }
+        }
+
+        function applyCategoryView(categories, mode, timestamp = null) {
+            renderCategoriesTable(categories);
+            renderCategoryChart(categories);
+            updateCategoryMetrics(categories);
+            updateSelectionCards(mode, timestamp);
+            updateSelectionBadge(mode, timestamp);
+
+            const title = document.getElementById('categoriesTitle');
+            const caption = document.getElementById('categoriesCaption');
+
+            if (mode === 'live') {
+                title.textContent = 'Категории: сейчас';
+                caption.textContent = 'Наведение не меняет текущий срез навсегда: клик фиксирует, уход курсора возвращает live-вид.';
+            } else if (mode === 'hover') {
+                title.textContent = `Категории: ${formatTimestamp(timestamp)}`;
+                caption.textContent = 'Это временный предпросмотр по наведению. Клик зафиксирует момент.';
+            } else {
+                title.textContent = `Категории: ${formatTimestamp(timestamp)}`;
+                caption.textContent = 'Срез зафиксирован. Кнопка справа или повторный клик по точке вернёт текущий момент.';
+            }
+        }
+
+        function applyLiveView() {
+            applyCategoryView(currentData.categories, 'live');
+        }
+
+        async function loadCategorySnapshot(timestamp, mode) {
+            if (!timestamp) {
+                return;
+            }
+
+            if (timestamp === currentData.last_update && currentData.categories.length > 0) {
+                categoryCache.set(timestamp, currentData.categories);
+            }
+
+            if (categoryCache.has(timestamp)) {
+                applyCategoryView(categoryCache.get(timestamp), mode, timestamp);
+                return;
+            }
+
+            if (previewAbortController) {
+                previewAbortController.abort();
+            }
+
+            previewAbortController = new AbortController();
+
+            try {
+                const response = await fetch(`get_category_history.php?timestamp=${encodeURIComponent(timestamp)}`, {
+                    cache: 'no-store',
+                    signal: previewAbortController.signal,
+                });
+                const payload = await response.json();
+
+                if (!response.ok || payload.error) {
+                    throw new Error(payload.error || 'Не удалось загрузить исторический срез');
+                }
+
+                categoryCache.set(timestamp, payload.data || []);
+                if ((mode === 'pinned' && pinnedTimestamp === timestamp) || (mode === 'hover' && !pinnedTimestamp && hoveredTimestamp === timestamp)) {
+                    applyCategoryView(payload.data || [], mode, timestamp);
+                }
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    return;
+                }
+
+                showStatus(error.message || 'Ошибка загрузки исторического среза', 'error');
+                if (!pinnedTimestamp) {
+                    applyLiveView();
+                }
+            } finally {
+                previewAbortController = null;
+            }
+        }
+
+        function pruneCategoryCache() {
+            const validTimestamps = new Set((historyPayload.data || []).map(item => item.timestamp));
+            if (currentData.last_update) {
+                validTimestamps.add(currentData.last_update);
+            }
+
+            for (const timestamp of categoryCache.keys()) {
+                if (!validTimestamps.has(timestamp)) {
+                    categoryCache.delete(timestamp);
+                }
+            }
+        }
+
+        async function refreshHistory(hours) {
+            const response = await fetch(`get_history_data.php?hours=${encodeURIComponent(hours)}`, {
+                cache: 'no-store',
             });
-            
-            // Автообновление
-            autoRefreshCheckbox.change(function() {
-                const isChecked = this.checked;
-                
-                localStorage.setItem('autoRefreshEnabled', isChecked);
-                
-                if (isChecked) {
-                    if (!isFirstLoad) {
-                        refreshInterval = setInterval(refreshData, 300000); // 5 минут
-                    }
+            const payload = await response.json();
+
+            if (!response.ok) {
+                throw new Error('Не удалось загрузить историю');
+            }
+
+            historyPayload = payload;
+            selectedHistoryHours = payload.hours || hours;
+            document.getElementById('historyHoursSelect').value = String(selectedHistoryHours);
+            renderHistoryChart();
+            pruneCategoryCache();
+
+            if (pinnedTimestamp && !(historyPayload.data || []).some(item => item.timestamp === pinnedTimestamp)) {
+                pinnedTimestamp = null;
+                hoveredTimestamp = null;
+                applyLiveView();
+            }
+        }
+
+        async function refreshDashboard({ force = false } = {}) {
+            if (isRefreshing) {
+                return;
+            }
+
+            isRefreshing = true;
+            document.getElementById('refreshButton').disabled = true;
+
+            if (force) {
+                setRefreshBadge('Обновляю срез', 'working');
+            } else if (currentData.meta.is_stale || !currentData.last_update) {
+                setRefreshBadge('Проверяю инстансы', 'working');
+            }
+
+            try {
+                const query = force ? '?force=1' : '';
+                const response = await fetch(`get_current_data.php${query}`, {
+                    cache: 'no-store',
+                });
+                const payload = await response.json();
+
+                if (!response.ok && !payload.last_update) {
+                    throw new Error(payload.meta?.refresh?.error || 'Не удалось получить текущие данные');
+                }
+
+                currentData = payload;
+                if (currentData.last_update) {
+                    categoryCache.set(currentData.last_update, currentData.categories);
+                }
+
+                updateInstancesHealth();
+                updateRefreshStatus();
+                renderInstancesTable();
+
+                await refreshHistory(selectedHistoryHours);
+
+                if (pinnedTimestamp) {
+                    await loadCategorySnapshot(pinnedTimestamp, 'pinned');
                 } else {
-                    clearInterval(refreshInterval);
+                    applyLiveView();
                 }
-            });
-            
-            // Инициализация автообновления
-            if (autoRefreshCheckbox.is(':checked')) {
-                refreshInterval = setInterval(refreshData, 300000);
+
+                if (force) {
+                    const summary = currentData.meta.refresh?.summary;
+                    if (summary) {
+                        const suffix = summary.error_count > 0
+                            ? `, ошибок: ${summary.error_count}`
+                            : '';
+                        showStatus(`Срез обновлён: успешно ${summary.success_count}${suffix}`, summary.error_count > 0 ? 'error' : 'success');
+                    } else if (currentData.meta.refresh?.in_progress) {
+                        showStatus('Обновление уже выполняется другим запросом', 'success');
+                    }
+                }
+            } catch (error) {
+                showStatus(error.message || 'Ошибка обновления', 'error');
+            } finally {
+                isRefreshing = false;
+                document.getElementById('refreshButton').disabled = false;
             }
-            
-            $(window).on('load', function() {
-                isFirstLoad = false;
+        }
+
+        function configureAutoRefresh(enabled) {
+            if (autoRefreshTimer) {
+                clearInterval(autoRefreshTimer);
+                autoRefreshTimer = null;
+            }
+
+            if (enabled) {
+                autoRefreshTimer = setInterval(() => {
+                    refreshDashboard({ force: false });
+                }, pollIntervalMs);
+            }
+        }
+
+        function showStatus(message, type = 'success') {
+            const element = document.getElementById('statusMessage');
+            element.className = `status-message visible ${type}`;
+            element.textContent = message;
+
+            window.clearTimeout(showStatus.timeoutId);
+            showStatus.timeoutId = window.setTimeout(() => {
+                element.className = 'status-message';
+            }, 3200);
+        }
+
+        function resolveTimestampFromEvent(event) {
+            if (!historyChartInstance || !historyChartInstance.$timestamps) {
+                return null;
+            }
+
+            const points = historyChartInstance.getElementsAtEventForMode(event, 'nearest', { intersect: false }, false);
+            if (!points.length) {
+                return null;
+            }
+
+            return historyChartInstance.$timestamps[points[0].index] || null;
+        }
+
+        function attachHistoryInteractions() {
+            const canvas = document.getElementById('historyChart');
+
+            canvas.addEventListener('mousemove', event => {
+                if (pinnedTimestamp) {
+                    return;
+                }
+
+                const timestamp = resolveTimestampFromEvent(event);
+                if (!timestamp || hoveredTimestamp === timestamp) {
+                    return;
+                }
+
+                hoveredTimestamp = timestamp;
+                loadCategorySnapshot(timestamp, 'hover');
             });
 
-            // анимация обновления
-            function showUpdateIndicator() {
-                const indicator = document.createElement('div');
-                indicator.className = 'update-indicator';
-                document.body.appendChild(indicator);
-                setTimeout(() => indicator.remove(), 1000);
-            }
-            
-            // Инициализация сортировки таблицы
-            $('#categoriesTable').on('click', '.sortable', function() {
-                const table = this.closest('table');
-                const column = this.dataset.column;
-                const currentDirection = this.querySelector('.sort-arrow').classList.contains('asc') ? 'desc' : 'asc';
-                
-                sortTable(table, column, currentDirection);
-                
-                localStorage.setItem('categoriesTableSort', JSON.stringify({
-                    column: column,
-                    direction: currentDirection
-                }));
-            });
-            
-            // Восстановление состояния сортировки
-            const savedSort = localStorage.getItem('categoriesTableSort');
-            if (savedSort) {
-                try {
-                    const { column, direction } = JSON.parse(savedSort);
-                    const table = document.getElementById('categoriesTable');
-                    sortTable(table, column, direction);
-                } catch (e) {
-                    console.error('Error loading sort state:', e);
+            canvas.addEventListener('mouseleave', () => {
+                hoveredTimestamp = null;
+                if (!pinnedTimestamp) {
+                    applyLiveView();
                 }
+            });
+
+            canvas.addEventListener('click', async event => {
+                const timestamp = resolveTimestampFromEvent(event);
+                if (!timestamp) {
+                    return;
+                }
+
+                if (pinnedTimestamp === timestamp) {
+                    pinnedTimestamp = null;
+                    hoveredTimestamp = null;
+                    applyLiveView();
+                    return;
+                }
+
+                pinnedTimestamp = timestamp;
+                hoveredTimestamp = timestamp;
+                await loadCategorySnapshot(timestamp, 'pinned');
+            });
+        }
+
+        function attachCategorySorting() {
+            document.querySelectorAll('#categoriesTable thead th.sortable').forEach(header => {
+                header.addEventListener('click', () => {
+                    const column = header.dataset.column;
+                    if (!column) {
+                        return;
+                    }
+
+                    if (categorySortState.column === column) {
+                        categorySortState.direction = categorySortState.direction === 'asc' ? 'desc' : 'asc';
+                    } else {
+                        categorySortState = {
+                            column,
+                            direction: column === 'category' || column === 'instances' ? 'asc' : 'desc',
+                        };
+                    }
+
+                    saveCategorySortState();
+
+                    if (pinnedTimestamp) {
+                        loadCategorySnapshot(pinnedTimestamp, 'pinned');
+                    } else if (hoveredTimestamp) {
+                        loadCategorySnapshot(hoveredTimestamp, 'hover');
+                    } else {
+                        applyLiveView();
+                    }
+                });
+            });
+        }
+
+        function boot() {
+            renderHistoryChart();
+            renderCategoryChart(currentData.categories);
+            renderInstancesTable();
+            updateInstancesHealth();
+            updateRefreshStatus();
+            applyLiveView();
+            attachHistoryInteractions();
+            attachCategorySorting();
+
+            const refreshButton = document.getElementById('refreshButton');
+            const autoRefreshCheckbox = document.getElementById('autoRefreshCheckbox');
+            const historyHoursSelect = document.getElementById('historyHoursSelect');
+            const clearSelectionButton = document.getElementById('clearSelectionButton');
+
+            const storedAutoRefresh = localStorage.getItem('qbitStatsAutoRefresh');
+            const autoRefreshEnabled = storedAutoRefresh === null ? true : storedAutoRefresh === 'true';
+            autoRefreshCheckbox.checked = autoRefreshEnabled;
+            configureAutoRefresh(autoRefreshEnabled);
+
+            refreshButton.addEventListener('click', () => {
+                refreshDashboard({ force: true });
+            });
+
+            autoRefreshCheckbox.addEventListener('change', event => {
+                const enabled = event.target.checked;
+                localStorage.setItem('qbitStatsAutoRefresh', String(enabled));
+                configureAutoRefresh(enabled);
+            });
+
+            historyHoursSelect.addEventListener('change', async event => {
+                try {
+                    await refreshHistory(Number(event.target.value));
+                    if (pinnedTimestamp) {
+                        await loadCategorySnapshot(pinnedTimestamp, 'pinned');
+                    } else {
+                        applyLiveView();
+                    }
+                } catch (error) {
+                    showStatus(error.message || 'Не удалось переключить диапазон истории', 'error');
+                }
+            });
+
+            clearSelectionButton.addEventListener('click', () => {
+                pinnedTimestamp = null;
+                hoveredTimestamp = null;
+                applyLiveView();
+            });
+
+            if (currentData.meta.refresh?.error) {
+                showStatus(currentData.meta.refresh.error, 'error');
             }
-            
-            // Инициализация графиков
-            initHistoryChart(historyData); // Теперь принимает данные
-            initCategoryChart(currentData.categories);
-        });
+
+            if (!bootRefreshScheduled) {
+                bootRefreshScheduled = true;
+                window.setTimeout(() => {
+                    refreshDashboard({ force: false });
+                }, 120);
+            }
+        }
+
+        boot();
     </script>
 </body>
 </html>

@@ -1,23 +1,20 @@
 <?php
+
 header('Content-Type: application/json');
-$config = require __DIR__.'/config.php';
-require __DIR__.'/data_functions.php';
 
-$db = new SQLite3($config['db_path']);
+$config = require __DIR__ . '/config.php';
+require_once __DIR__ . '/collector.php';
+require_once __DIR__ . '/data_functions.php';
 
-// Если используется кэширование на стороне клиента
-if (isset($_SERVER['HTTP_IF_MODIFIED_SINCE'])) {
-    $last_client_update = $_SERVER['HTTP_IF_MODIFIED_SINCE'];
-    $last_server_update = $db->querySingle("SELECT last_update FROM instances ORDER BY last_update DESC LIMIT 1");
-    
-    if ($last_client_update === $last_server_update) {
-        http_response_code(304); // Not Modified
-        exit;
-    }
+$forceRefresh = isset($_GET['force']) && $_GET['force'] === '1';
+$refresh = maybe_refresh_stats($config, $forceRefresh);
+
+$db = open_database($config);
+$data = get_current_data($db, $config, $refresh);
+$db->close();
+
+if (!empty($refresh['error']) && empty($data['last_update'])) {
+    http_response_code(503);
 }
 
-$data = get_current_data($db, $config); // Передаём подключение к БД и конфиг
-
-// Для следующей проверки свежести данных
-header("Last-Modified: " . $data['last_update']);
-echo json_encode($data);
+echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);

@@ -1,0 +1,252 @@
+<?php
+
+function get_monitor_settings(array $config): array
+{
+    $defaults = [
+        'refresh_ttl_seconds' => 60,
+        'history_hours_default' => 6,
+        'history_hours_options' => [1, 6, 24],
+        'history_retention_days' => 7,
+        'connect_timeout_seconds' => 5,
+        'request_timeout_seconds' => 20,
+        'parallel_sync_limit' => 7,
+        'debug_sync' => false,
+        'lock_path' => __DIR__ . '/qbittorrent_stats.lock',
+    ];
+
+    $settings = $config['settings'] ?? [];
+    $merged = array_merge($defaults, $settings);
+
+    $hoursOptions = array_values(array_unique(array_map('intval', $merged['history_hours_options'])));
+    sort($hoursOptions);
+
+    if (empty($hoursOptions)) {
+        $hoursOptions = $defaults['history_hours_options'];
+    }
+
+    $defaultHours = (int)$merged['history_hours_default'];
+    if (!in_array($defaultHours, $hoursOptions, true)) {
+        $hoursOptions[] = $defaultHours;
+        sort($hoursOptions);
+    }
+
+    $merged['history_hours_default'] = $defaultHours;
+    $merged['history_hours_options'] = $hoursOptions;
+    $merged['refresh_ttl_seconds'] = max(5, (int)$merged['refresh_ttl_seconds']);
+    $merged['history_retention_days'] = max(1, (int)$merged['history_retention_days']);
+    $merged['connect_timeout_seconds'] = max(1, (int)$merged['connect_timeout_seconds']);
+    $merged['request_timeout_seconds'] = max($merged['connect_timeout_seconds'], (int)$merged['request_timeout_seconds']);
+    $merged['parallel_sync_limit'] = max(1, (int)$merged['parallel_sync_limit']);
+    $merged['debug_sync'] = (bool)$merged['debug_sync'];
+
+    return $merged;
+}
+
+function open_database(array $config): SQLite3
+{
+    $db = new SQLite3($config['db_path']);
+    $db->enableExceptions(true);
+    $db->busyTimeout(5000);
+    $db->exec('PRAGMA journal_mode=WAL');
+    $db->exec('PRAGMA foreign_keys=ON');
+
+    ensure_schema($db);
+
+    return $db;
+}
+
+function ensure_schema(SQLite3 $db): void
+{
+    $db->exec('CREATE TABLE IF NOT EXISTS instances (
+        name TEXT PRIMARY KEY,
+        dl_speed INTEGER DEFAULT 0,
+        up_speed INTEGER DEFAULT 0,
+        dl_session INTEGER DEFAULT 0,
+        up_session INTEGER DEFAULT 0,
+        last_update DATETIME,
+        status TEXT DEFAULT "unknown",
+        last_error TEXT,
+        last_attempt DATETIME,
+        last_success DATETIME
+    )');
+
+    $db->exec('CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        active_torrents INTEGER DEFAULT 0,
+        dl_speed INTEGER DEFAULT 0,
+        up_speed INTEGER DEFAULT 0,
+        total_size INTEGER DEFAULT 0,
+        uploaded_session INTEGER DEFAULT 0,
+        uploaded_total INTEGER DEFAULT 0,
+        last_update DATETIME,
+        UNIQUE(instance_name, category)
+    )');
+
+    $db->exec('CREATE TABLE IF NOT EXISTS speed_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_name TEXT NOT NULL,
+        dl_speed INTEGER DEFAULT 0,
+        up_speed INTEGER DEFAULT 0,
+        timestamp DATETIME NOT NULL
+    )');
+
+    $db->exec('CREATE TABLE IF NOT EXISTS category_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instance_name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        active_torrents INTEGER DEFAULT 0,
+        dl_speed INTEGER DEFAULT 0,
+        up_speed INTEGER DEFAULT 0,
+        total_size INTEGER DEFAULT 0,
+        uploaded_session INTEGER DEFAULT 0,
+        uploaded_total INTEGER DEFAULT 0,
+        timestamp DATETIME NOT NULL
+    )');
+
+    $db->exec('CREATE TABLE IF NOT EXISTS torrents (
+        instance_name TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        category TEXT,
+        state TEXT,
+        dlspeed INTEGER DEFAULT 0,
+        upspeed INTEGER DEFAULT 0,
+        size INTEGER DEFAULT 0,
+        uploaded_total INTEGER DEFAULT 0,
+        uploaded_session INTEGER DEFAULT 0,
+        PRIMARY KEY (instance_name, hash)
+    )');
+
+    $db->exec('CREATE TABLE IF NOT EXISTS instance_sync_state (
+        instance_name TEXT PRIMARY KEY,
+        last_rid INTEGER DEFAULT 0
+    )');
+
+    $db->exec('CREATE TABLE IF NOT EXISTS instance_sessions (
+        instance_name TEXT PRIMARY KEY,
+        sid TEXT,
+        last_login DATETIME
+    )');
+
+    ensure_table_columns($db, 'instances', [
+        'status' => 'TEXT DEFAULT "unknown"',
+        'last_error' => 'TEXT',
+        'last_attempt' => 'DATETIME',
+        'last_success' => 'DATETIME',
+    ]);
+
+    ensure_table_columns($db, 'categories', [
+        'uploaded_total' => 'INTEGER DEFAULT 0',
+    ]);
+
+    ensure_table_columns($db, 'category_history', [
+        'uploaded_total' => 'INTEGER DEFAULT 0',
+    ]);
+
+    $db->exec("UPDATE instances SET status = 'unknown' WHERE status IS NULL OR status = ''");
+    $db->exec('UPDATE instances SET last_success = last_update WHERE last_success IS NULL AND last_update IS NOT NULL');
+    $db->exec('UPDATE instances SET last_attempt = last_update WHERE last_attempt IS NULL AND last_update IS NOT NULL');
+
+    ensure_indexes($db);
+}
+
+function ensure_table_columns(SQLite3 $db, string $table, array $columns): void
+{
+    $existingColumns = get_table_columns($db, $table);
+
+    foreach ($columns as $column => $definition) {
+        if (isset($existingColumns[$column])) {
+            continue;
+        }
+
+        $db->exec(sprintf(
+            'ALTER TABLE %s ADD COLUMN %s %s',
+            $table,
+            $column,
+            $definition
+        ));
+    }
+}
+
+function get_table_columns(SQLite3 $db, string $table): array
+{
+    $columns = [];
+    $result = $db->query(sprintf('PRAGMA table_info(%s)', $table));
+
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $columns[$row['name']] = $row;
+    }
+
+    return $columns;
+}
+
+function ensure_indexes(SQLite3 $db): void
+{
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_speed_history_timestamp ON speed_history (timestamp)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_speed_history_instance_timestamp ON speed_history (instance_name, timestamp)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_category_history_timestamp ON category_history (timestamp)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_category_history_timestamp_category ON category_history (timestamp, category)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_categories_category ON categories (category)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_torrents_instance ON torrents (instance_name)');
+}
+
+function get_latest_update(SQLite3 $db): ?string
+{
+    $value = $db->querySingle('SELECT MAX(last_update) FROM instances WHERE last_update IS NOT NULL');
+
+    return $value !== null && $value !== '' ? $value : null;
+}
+
+function is_refresh_needed(SQLite3 $db, array $config): bool
+{
+    $latestUpdate = get_latest_update($db);
+    if ($latestUpdate === null) {
+        return true;
+    }
+
+    $settings = get_monitor_settings($config);
+    $latestTimestamp = strtotime($latestUpdate);
+    if ($latestTimestamp === false) {
+        return true;
+    }
+
+    return (time() - $latestTimestamp) >= $settings['refresh_ttl_seconds'];
+}
+
+function normalize_history_hours(array $config, $hours): int
+{
+    $settings = get_monitor_settings($config);
+    $value = (int)$hours;
+
+    if (!in_array($value, $settings['history_hours_options'], true)) {
+        return $settings['history_hours_default'];
+    }
+
+    return $value;
+}
+
+function get_refresh_lock_path(array $config): string
+{
+    $settings = get_monitor_settings($config);
+
+    return $settings['lock_path'];
+}
+
+function is_sync_debug_enabled(array $config): bool
+{
+    $settings = get_monitor_settings($config);
+
+    return (bool)$settings['debug_sync'];
+}
+
+function truncate_error_message(string $message, int $limit = 240): string
+{
+    $message = trim(preg_replace('/\s+/', ' ', $message));
+
+    if (strlen($message) <= $limit) {
+        return $message;
+    }
+
+    return substr($message, 0, $limit - 3) . '...';
+}
