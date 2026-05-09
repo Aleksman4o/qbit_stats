@@ -318,7 +318,7 @@ $defaultHistoryHours = $historyData['hours'];
         }
 
         .chart-wrap.compact {
-            height: 460px;
+            height: 420px;
         }
 
         .table-shell {
