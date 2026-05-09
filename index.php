@@ -318,7 +318,7 @@ $defaultHistoryHours = $historyData['hours'];
         }
 
         .chart-wrap.compact {
-            height: 520px;
+            height: 460px;
         }
 
         .table-shell {
@@ -502,9 +502,9 @@ $defaultHistoryHours = $historyData['hours'];
     <div class="page">
         <header class="page-header">
             <div>
-                <p class="eyebrow">qBit Stats</p>
+                <p class="eyebrow">qBit Stats V2</p>
                 <h1>Категории в реальном времени</h1>
-                <p class="subtitle">Дашборд сам собирает свежий срез, пока открыт. Таймлайн нужен не для тултипов, а для мгновенного просмотра состава категорий в конкретный момент.</p>
+                <p class="subtitle">Дашборд сам собирает свежий срез, пока открыт. Наведите мышь на таймлайн, для мгновенного просмотра состава категорий в конкретный момент.</p>
             </div>
             <div class="header-meta">
                 <span id="refreshBadge" class="badge success">Срез актуален</span>
@@ -643,7 +643,7 @@ $defaultHistoryHours = $historyData['hours'];
                 <div class="panel-head">
                     <div>
                         <h2>Состояние инстансов</h2>
-                        <p class="panel-copy">Этот блок диагностический: категории важнее, но здесь видно, кто дал срез, а кто выпал.</p>
+                        <p class="panel-copy">Этот блок диагностический: здесь видно, кто дал срез, а кто выпал.</p>
                     </div>
                 </div>
                 <div class="table-shell">
@@ -693,6 +693,7 @@ $defaultHistoryHours = $historyData['hours'];
         let historyChartInstance = null;
         let categoryChartInstance = null;
         let autoRefreshTimer = null;
+        let followupRefreshTimer = null;
         let isRefreshing = false;
         let bootRefreshScheduled = false;
         let hoveredTimestamp = null;
@@ -705,7 +706,7 @@ $defaultHistoryHours = $historyData['hours'];
             categoryCache.set(currentData.last_update, currentData.categories);
         }
 
-        const pollIntervalMs = Math.max(30000, (currentData.meta.refresh_ttl_seconds || 60) * 1000);
+        const pollIntervalMs = Math.max(5000, (currentData.meta.dashboard_poll_interval_seconds || 30) * 1000);
 
         function formatSpeed(bytes) {
             const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
@@ -1002,6 +1003,8 @@ $defaultHistoryHours = $historyData['hours'];
                     borderColor: topCategories.map(category => makeColor(category.category, 0.92)),
                     borderWidth: 1.4,
                     borderRadius: 10,
+                    categoryPercentage: 0.96,
+                    barPercentage: 0.98,
                     maxBarThickness: 22,
                 }],
             };
@@ -1080,13 +1083,13 @@ $defaultHistoryHours = $historyData['hours'];
         function updateSelectionCards(mode, timestamp) {
             const titleMap = {
                 live: 'Сейчас',
-                hover: 'Предпросмотр',
+                hover: 'Просмотр',
                 pinned: 'Фиксация',
             };
 
             document.getElementById('selectionModeValue').textContent = titleMap[mode] || 'Сейчас';
             document.getElementById('selectionModeSubvalue').textContent = mode === 'live'
-                ? 'Последний успешный срез'
+                ? 'Текущий успешный срез'
                 : formatTimestamp(timestamp);
         }
 
@@ -1319,6 +1322,11 @@ $defaultHistoryHours = $historyData['hours'];
                         showStatus('Обновление уже выполняется другим запросом', 'success');
                     }
                 }
+
+                const autoRefreshCheckbox = document.getElementById('autoRefreshCheckbox');
+                if (!force && autoRefreshCheckbox?.checked && currentData.meta.refresh?.in_progress && !currentData.last_update) {
+                    scheduleFollowupRefresh(3000);
+                }
             } catch (error) {
                 showStatus(error.message || 'Ошибка обновления', 'error');
             } finally {
@@ -1327,10 +1335,26 @@ $defaultHistoryHours = $historyData['hours'];
             }
         }
 
+        function scheduleFollowupRefresh(delayMs) {
+            if (followupRefreshTimer) {
+                clearTimeout(followupRefreshTimer);
+            }
+
+            followupRefreshTimer = window.setTimeout(() => {
+                followupRefreshTimer = null;
+                refreshDashboard({ force: false });
+            }, delayMs);
+        }
+
         function configureAutoRefresh(enabled) {
             if (autoRefreshTimer) {
                 clearInterval(autoRefreshTimer);
                 autoRefreshTimer = null;
+            }
+
+            if (followupRefreshTimer) {
+                clearTimeout(followupRefreshTimer);
+                followupRefreshTimer = null;
             }
 
             if (enabled) {

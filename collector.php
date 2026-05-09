@@ -89,13 +89,17 @@ function maybe_refresh_stats(array $config, bool $force = false): array
 
 function collect_stats(SQLite3 $db, array $config): array
 {
+    $collectStartedAt = microtime(true);
     $snapshotTime = date('Y-m-d H:i:s');
     $instanceResults = [];
     $successCount = 0;
     $errorCount = 0;
     $debugEnabled = is_sync_debug_enabled($config);
     $instanceStates = load_instance_runtime_states($db, $config['instances']);
+    $networkStartedAt = microtime(true);
     $remoteSnapshots = fetch_instance_snapshots($config, $instanceStates);
+    $networkElapsedMs = round((microtime(true) - $networkStartedAt) * 1000, 1);
+    $persistStartedAt = microtime(true);
 
     foreach ($config['instances'] as $instance) {
         $name = $instance['name'];
@@ -106,11 +110,13 @@ function collect_stats(SQLite3 $db, array $config): array
         $debugInfo = $remoteResult['debug'] ?? [];
 
         try {
+            $persistInstanceStartedAt = microtime(true);
             if (!empty($remoteResult['error'])) {
                 throw new RuntimeException($remoteResult['error']);
             }
 
             $persisted = persist_instance_snapshot($db, $instance, $snapshotTime, $remoteResult['snapshot']);
+            $persistElapsedMs = round((microtime(true) - $persistInstanceStartedAt) * 1000, 1);
             $instanceResult = [
                 'instance' => $name,
                 'status' => 'ok',
@@ -122,13 +128,16 @@ function collect_stats(SQLite3 $db, array $config): array
             ];
 
             if ($debugEnabled) {
+                $debugInfo['persist_ms'] = $persistElapsedMs;
                 $instanceResult['debug'] = $debugInfo;
             }
 
             $instanceResults[] = $instanceResult;
             $successCount++;
         } catch (Throwable $e) {
+            $persistInstanceStartedAt = $persistInstanceStartedAt ?? microtime(true);
             persist_instance_error($db, $instance, $snapshotTime, truncate_error_message($e->getMessage()));
+            $persistElapsedMs = round((microtime(true) - $persistInstanceStartedAt) * 1000, 1);
 
             $instanceResult = [
                 'instance' => $name,
@@ -141,6 +150,7 @@ function collect_stats(SQLite3 $db, array $config): array
             ];
 
             if ($debugEnabled && !empty($debugInfo)) {
+                $debugInfo['persist_ms'] = $persistElapsedMs;
                 $instanceResult['debug'] = $debugInfo;
             }
 
@@ -149,15 +159,27 @@ function collect_stats(SQLite3 $db, array $config): array
         }
     }
 
+    $persistElapsedMs = round((microtime(true) - $persistStartedAt) * 1000, 1);
     cleanup_history($db, $config);
+    $collectElapsedMs = round((microtime(true) - $collectStartedAt) * 1000, 1);
 
-    return [
+    $summary = [
         'status' => $errorCount === 0 ? 'success' : ($successCount > 0 ? 'partial' : 'error'),
         'updated' => $snapshotTime,
         'success_count' => $successCount,
         'error_count' => $errorCount,
         'instances' => $instanceResults,
     ];
+
+    if ($debugEnabled) {
+        $summary['timings'] = [
+            'network_total_ms' => $networkElapsedMs,
+            'persist_total_ms' => $persistElapsedMs,
+            'collect_total_ms' => $collectElapsedMs,
+        ];
+    }
+
+    return $summary;
 }
 
 function load_instance_runtime_states(SQLite3 $db, array $instances): array
@@ -438,6 +460,7 @@ function create_instance_debug_info(?string $storedSid): array
         'sync_retry_http_code' => null,
         'sync_ms' => null,
         'sync_bytes' => null,
+        'persist_ms' => null,
     ];
 }
 
@@ -761,16 +784,12 @@ function persist_instance_snapshot(SQLite3 $db, array $instance, string $snapsho
             );
         }
 
-        $refreshCategories = $db->prepare('UPDATE categories SET last_update = :last_update WHERE instance_name = :instance_name');
-        $refreshCategories->bindValue(':instance_name', $instance['name'], SQLITE3_TEXT);
-        $refreshCategories->bindValue(':last_update', $snapshotTime, SQLITE3_TEXT);
-        $refreshCategories->execute();
-
         $updateInstance = $db->prepare('UPDATE instances
             SET dl_speed = :dl_speed,
                 up_speed = :up_speed,
                 dl_session = :dl_session,
                 up_session = :up_session,
+                torrent_count = :torrent_count,
                 last_update = :last_update,
                 status = :status,
                 last_error = NULL,
@@ -782,6 +801,7 @@ function persist_instance_snapshot(SQLite3 $db, array $instance, string $snapsho
         $updateInstance->bindValue(':up_speed', (int)($serverState['up_info_speed'] ?? $transfer['up_info_speed'] ?? 0), SQLITE3_INTEGER);
         $updateInstance->bindValue(':dl_session', (int)($serverState['dl_info_data'] ?? $transfer['dl_info_data'] ?? 0), SQLITE3_INTEGER);
         $updateInstance->bindValue(':up_session', (int)($serverState['up_info_data'] ?? $transfer['up_info_data'] ?? 0), SQLITE3_INTEGER);
+        $updateInstance->bindValue(':torrent_count', $torrentCount, SQLITE3_INTEGER);
         $updateInstance->bindValue(':last_update', $snapshotTime, SQLITE3_TEXT);
         $updateInstance->bindValue(':status', 'ok', SQLITE3_TEXT);
         $updateInstance->bindValue(':last_attempt', $snapshotTime, SQLITE3_TEXT);
@@ -859,6 +879,7 @@ function persist_incremental_instance_snapshot_data(SQLite3 $db, string $instanc
 {
     $changedHashes = array_values(array_unique(array_merge(array_keys($torrentsData), $torrentsRemoved)));
     $existingTorrents = load_torrent_rows_by_hashes($db, $instanceName, $changedHashes);
+    $torrentCount = load_instance_torrent_count($db, $instanceName);
     $categoryDeltas = [];
     $deletedHashes = [];
     $upsertRows = [];
@@ -870,6 +891,7 @@ function persist_incremental_instance_snapshot_data(SQLite3 $db, string $instanc
 
         apply_torrent_category_delta($categoryDeltas, $existingTorrents[$hash], -1);
         $deletedHashes[] = $hash;
+        $torrentCount--;
     }
 
     foreach ($torrentsData as $hash => $torrent) {
@@ -878,6 +900,8 @@ function persist_incremental_instance_snapshot_data(SQLite3 $db, string $instanc
 
         if ($oldRow !== null) {
             apply_torrent_category_delta($categoryDeltas, $oldRow, -1);
+        } else {
+            $torrentCount++;
         }
 
         apply_torrent_category_delta($categoryDeltas, $newRow, 1);
@@ -909,7 +933,7 @@ function persist_incremental_instance_snapshot_data(SQLite3 $db, string $instanc
         upsert_category_rows($db, $instanceName, $snapshotTime, $updatedCategories);
     }
 
-    return get_instance_torrent_count($db, $instanceName);
+    return max(0, $torrentCount);
 }
 
 function normalize_torrent_row(string $hash, ?array $current, array $torrent): array
@@ -967,43 +991,46 @@ function load_torrent_rows_by_hashes(SQLite3 $db, string $instanceName, array $h
         return [];
     }
 
-    $placeholders = [];
-    foreach (array_values($hashes) as $index => $hash) {
-        $placeholders[] = ':hash_' . $index;
-    }
-
-    $stmt = $db->prepare('SELECT
-        hash,
-        category,
-        state,
-        dlspeed,
-        upspeed,
-        size,
-        uploaded_total,
-        uploaded_session
-        FROM torrents
-        WHERE instance_name = :instance_name
-          AND hash IN (' . implode(', ', $placeholders) . ')');
-    $stmt->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
-
-    foreach (array_values($hashes) as $index => $hash) {
-        $stmt->bindValue(':hash_' . $index, $hash, SQLITE3_TEXT);
-    }
-
-    $result = $stmt->execute();
     $rows = [];
 
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $rows[$row['hash']] = [
-            'hash' => $row['hash'],
-            'category' => $row['category'] !== '' ? $row['category'] : 'Uncategorized',
-            'state' => $row['state'] !== '' ? $row['state'] : 'unknown',
-            'dlspeed' => (int)$row['dlspeed'],
-            'upspeed' => (int)$row['upspeed'],
-            'size' => (int)$row['size'],
-            'uploaded_total' => (int)$row['uploaded_total'],
-            'uploaded_session' => (int)$row['uploaded_session'],
-        ];
+    foreach (array_chunk(array_values($hashes), 400) as $hashChunk) {
+        $placeholders = [];
+        foreach ($hashChunk as $index => $hash) {
+            $placeholders[] = ':hash_' . $index;
+        }
+
+        $stmt = $db->prepare('SELECT
+            hash,
+            category,
+            state,
+            dlspeed,
+            upspeed,
+            size,
+            uploaded_total,
+            uploaded_session
+            FROM torrents
+            WHERE instance_name = :instance_name
+              AND hash IN (' . implode(', ', $placeholders) . ')');
+        $stmt->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
+
+        foreach ($hashChunk as $index => $hash) {
+            $stmt->bindValue(':hash_' . $index, $hash, SQLITE3_TEXT);
+        }
+
+        $result = $stmt->execute();
+
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $rows[$row['hash']] = [
+                'hash' => $row['hash'],
+                'category' => $row['category'] !== '' ? $row['category'] : 'Uncategorized',
+                'state' => $row['state'] !== '' ? $row['state'] : 'unknown',
+                'dlspeed' => (int)$row['dlspeed'],
+                'upspeed' => (int)$row['upspeed'],
+                'size' => (int)$row['size'],
+                'uploaded_total' => (int)$row['uploaded_total'],
+                'uploaded_session' => (int)$row['uploaded_session'],
+            ];
+        }
     }
 
     return $rows;
@@ -1015,11 +1042,21 @@ function delete_torrent_rows(SQLite3 $db, string $instanceName, array $hashes): 
         return;
     }
 
-    $stmt = $db->prepare('DELETE FROM torrents WHERE instance_name = :instance_name AND hash = :hash');
+    foreach (array_chunk(array_values($hashes), 400) as $hashChunk) {
+        $placeholders = [];
+        foreach ($hashChunk as $index => $hash) {
+            $placeholders[] = ':hash_' . $index;
+        }
 
-    foreach ($hashes as $hash) {
+        $stmt = $db->prepare('DELETE FROM torrents
+            WHERE instance_name = :instance_name
+              AND hash IN (' . implode(', ', $placeholders) . ')');
         $stmt->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
-        $stmt->bindValue(':hash', $hash, SQLITE3_TEXT);
+
+        foreach ($hashChunk as $index => $hash) {
+            $stmt->bindValue(':hash_' . $index, $hash, SQLITE3_TEXT);
+        }
+
         $stmt->execute();
     }
 }
@@ -1030,20 +1067,40 @@ function upsert_torrent_rows(SQLite3 $db, string $instanceName, array $rows): vo
         return;
     }
 
-    $stmt = $db->prepare('INSERT OR REPLACE INTO torrents
-        (instance_name, hash, category, state, dlspeed, upspeed, size, uploaded_total, uploaded_session)
-        VALUES (:instance_name, :hash, :category, :state, :dlspeed, :upspeed, :size, :uploaded_total, :uploaded_session)');
+    foreach (array_chunk($rows, 80, true) as $rowChunk) {
+        $placeholders = [];
+        $values = [];
 
-    foreach ($rows as $hash => $row) {
-        $stmt->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
-        $stmt->bindValue(':hash', $hash, SQLITE3_TEXT);
-        $stmt->bindValue(':category', $row['category'], SQLITE3_TEXT);
-        $stmt->bindValue(':state', $row['state'], SQLITE3_TEXT);
-        $stmt->bindValue(':dlspeed', (int)$row['dlspeed'], SQLITE3_INTEGER);
-        $stmt->bindValue(':upspeed', (int)$row['upspeed'], SQLITE3_INTEGER);
-        $stmt->bindValue(':size', (int)$row['size'], SQLITE3_INTEGER);
-        $stmt->bindValue(':uploaded_total', (int)$row['uploaded_total'], SQLITE3_INTEGER);
-        $stmt->bindValue(':uploaded_session', (int)$row['uploaded_session'], SQLITE3_INTEGER);
+        foreach ($rowChunk as $hash => $row) {
+            $placeholders[] = '(?, ?, ?, ?, ?, ?, ?, ?, ?)';
+            $values[] = $instanceName;
+            $values[] = $hash;
+            $values[] = $row['category'];
+            $values[] = $row['state'];
+            $values[] = (int)$row['dlspeed'];
+            $values[] = (int)$row['upspeed'];
+            $values[] = (int)$row['size'];
+            $values[] = (int)$row['uploaded_total'];
+            $values[] = (int)$row['uploaded_session'];
+        }
+
+        $stmt = $db->prepare('INSERT INTO torrents
+            (instance_name, hash, category, state, dlspeed, upspeed, size, uploaded_total, uploaded_session)
+            VALUES ' . implode(', ', $placeholders) . '
+            ON CONFLICT(instance_name, hash) DO UPDATE SET
+                category = excluded.category,
+                state = excluded.state,
+                dlspeed = excluded.dlspeed,
+                upspeed = excluded.upspeed,
+                size = excluded.size,
+                uploaded_total = excluded.uploaded_total,
+                uploaded_session = excluded.uploaded_session');
+
+        foreach ($values as $index => $value) {
+            $type = is_int($value) ? SQLITE3_INTEGER : SQLITE3_TEXT;
+            $stmt->bindValue($index + 1, $value, $type);
+        }
+
         $stmt->execute();
     }
 }
@@ -1054,40 +1111,43 @@ function load_category_rows_by_names(SQLite3 $db, string $instanceName, array $c
         return [];
     }
 
-    $placeholders = [];
-    foreach (array_values($categories) as $index => $category) {
-        $placeholders[] = ':category_' . $index;
-    }
-
-    $stmt = $db->prepare('SELECT
-        category,
-        active_torrents,
-        dl_speed,
-        up_speed,
-        total_size,
-        uploaded_session,
-        uploaded_total
-        FROM categories
-        WHERE instance_name = :instance_name
-          AND category IN (' . implode(', ', $placeholders) . ')');
-    $stmt->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
-
-    foreach (array_values($categories) as $index => $category) {
-        $stmt->bindValue(':category_' . $index, $category, SQLITE3_TEXT);
-    }
-
-    $result = $stmt->execute();
     $rows = [];
 
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $rows[$row['category']] = [
-            'active_torrents' => (int)$row['active_torrents'],
-            'dl_speed' => (int)$row['dl_speed'],
-            'up_speed' => (int)$row['up_speed'],
-            'total_size' => (int)$row['total_size'],
-            'uploaded_session' => (int)$row['uploaded_session'],
-            'uploaded_total' => (int)$row['uploaded_total'],
-        ];
+    foreach (array_chunk(array_values($categories), 400) as $categoryChunk) {
+        $placeholders = [];
+        foreach ($categoryChunk as $index => $category) {
+            $placeholders[] = ':category_' . $index;
+        }
+
+        $stmt = $db->prepare('SELECT
+            category,
+            active_torrents,
+            dl_speed,
+            up_speed,
+            total_size,
+            uploaded_session,
+            uploaded_total
+            FROM categories
+            WHERE instance_name = :instance_name
+              AND category IN (' . implode(', ', $placeholders) . ')');
+        $stmt->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
+
+        foreach ($categoryChunk as $index => $category) {
+            $stmt->bindValue(':category_' . $index, $category, SQLITE3_TEXT);
+        }
+
+        $result = $stmt->execute();
+
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $rows[$row['category']] = [
+                'active_torrents' => (int)$row['active_torrents'],
+                'dl_speed' => (int)$row['dl_speed'],
+                'up_speed' => (int)$row['up_speed'],
+                'total_size' => (int)$row['total_size'],
+                'uploaded_session' => (int)$row['uploaded_session'],
+                'uploaded_total' => (int)$row['uploaded_total'],
+            ];
+        }
     }
 
     return $rows;
@@ -1099,20 +1159,40 @@ function upsert_category_rows(SQLite3 $db, string $instanceName, string $snapsho
         return;
     }
 
-    $stmt = $db->prepare('INSERT OR REPLACE INTO categories
-        (instance_name, category, active_torrents, dl_speed, up_speed, total_size, uploaded_session, uploaded_total, last_update)
-        VALUES (:instance_name, :category, :active_torrents, :dl_speed, :up_speed, :total_size, :uploaded_session, :uploaded_total, :last_update)');
+    foreach (array_chunk($categories, 80, true) as $categoryChunk) {
+        $placeholders = [];
+        $values = [];
 
-    foreach ($categories as $category => $stats) {
-        $stmt->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
-        $stmt->bindValue(':category', $category, SQLITE3_TEXT);
-        $stmt->bindValue(':active_torrents', (int)$stats['active_torrents'], SQLITE3_INTEGER);
-        $stmt->bindValue(':dl_speed', (int)$stats['dl_speed'], SQLITE3_INTEGER);
-        $stmt->bindValue(':up_speed', (int)$stats['up_speed'], SQLITE3_INTEGER);
-        $stmt->bindValue(':total_size', (int)$stats['total_size'], SQLITE3_INTEGER);
-        $stmt->bindValue(':uploaded_session', (int)$stats['uploaded_session'], SQLITE3_INTEGER);
-        $stmt->bindValue(':uploaded_total', (int)$stats['uploaded_total'], SQLITE3_INTEGER);
-        $stmt->bindValue(':last_update', $snapshotTime, SQLITE3_TEXT);
+        foreach ($categoryChunk as $category => $stats) {
+            $placeholders[] = '(?, ?, ?, ?, ?, ?, ?, ?, ?)';
+            $values[] = $instanceName;
+            $values[] = $category;
+            $values[] = (int)$stats['active_torrents'];
+            $values[] = (int)$stats['dl_speed'];
+            $values[] = (int)$stats['up_speed'];
+            $values[] = (int)$stats['total_size'];
+            $values[] = (int)$stats['uploaded_session'];
+            $values[] = (int)$stats['uploaded_total'];
+            $values[] = $snapshotTime;
+        }
+
+        $stmt = $db->prepare('INSERT INTO categories
+            (instance_name, category, active_torrents, dl_speed, up_speed, total_size, uploaded_session, uploaded_total, last_update)
+            VALUES ' . implode(', ', $placeholders) . '
+            ON CONFLICT(instance_name, category) DO UPDATE SET
+                active_torrents = excluded.active_torrents,
+                dl_speed = excluded.dl_speed,
+                up_speed = excluded.up_speed,
+                total_size = excluded.total_size,
+                uploaded_session = excluded.uploaded_session,
+                uploaded_total = excluded.uploaded_total,
+                last_update = excluded.last_update');
+
+        foreach ($values as $index => $value) {
+            $type = is_int($value) ? SQLITE3_INTEGER : SQLITE3_TEXT;
+            $stmt->bindValue($index + 1, $value, $type);
+        }
+
         $stmt->execute();
     }
 }
@@ -1170,12 +1250,20 @@ function insert_category_history_snapshot(SQLite3 $db, string $instanceName, str
     $stmt->execute();
 }
 
-function get_instance_torrent_count(SQLite3 $db, string $instanceName): int
+function load_instance_torrent_count(SQLite3 $db, string $instanceName): int
 {
-    $stmt = $db->prepare('SELECT COUNT(*) AS total FROM torrents WHERE instance_name = :instance_name');
+    $stmt = $db->prepare('SELECT torrent_count FROM instances WHERE name = :instance_name');
     $stmt->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
 
-    return (int)$stmt->execute()->fetchArray(SQLITE3_ASSOC)['total'];
+    if ($row && $row['torrent_count'] !== null) {
+        return (int)$row['torrent_count'];
+    }
+
+    $fallback = $db->prepare('SELECT COUNT(*) AS total FROM torrents WHERE instance_name = :instance_name');
+    $fallback->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
+
+    return (int)$fallback->execute()->fetchArray(SQLITE3_ASSOC)['total'];
 }
 
 function create_empty_category_stats(): array

@@ -4,6 +4,7 @@ function get_monitor_settings(array $config): array
 {
     $defaults = [
         'refresh_ttl_seconds' => 60,
+        'dashboard_poll_interval_seconds' => 30,
         'history_hours_default' => 6,
         'history_hours_options' => [1, 6, 24],
         'history_retention_days' => 7,
@@ -33,6 +34,7 @@ function get_monitor_settings(array $config): array
     $merged['history_hours_default'] = $defaultHours;
     $merged['history_hours_options'] = $hoursOptions;
     $merged['refresh_ttl_seconds'] = max(5, (int)$merged['refresh_ttl_seconds']);
+    $merged['dashboard_poll_interval_seconds'] = max(5, (int)$merged['dashboard_poll_interval_seconds']);
     $merged['history_retention_days'] = max(1, (int)$merged['history_retention_days']);
     $merged['connect_timeout_seconds'] = max(1, (int)$merged['connect_timeout_seconds']);
     $merged['request_timeout_seconds'] = max($merged['connect_timeout_seconds'], (int)$merged['request_timeout_seconds']);
@@ -48,6 +50,8 @@ function open_database(array $config): SQLite3
     $db->enableExceptions(true);
     $db->busyTimeout(5000);
     $db->exec('PRAGMA journal_mode=WAL');
+    $db->exec('PRAGMA synchronous=NORMAL');
+    $db->exec('PRAGMA temp_store=MEMORY');
     $db->exec('PRAGMA foreign_keys=ON');
 
     ensure_schema($db);
@@ -63,6 +67,7 @@ function ensure_schema(SQLite3 $db): void
         up_speed INTEGER DEFAULT 0,
         dl_session INTEGER DEFAULT 0,
         up_session INTEGER DEFAULT 0,
+        torrent_count INTEGER DEFAULT 0,
         last_update DATETIME,
         status TEXT DEFAULT "unknown",
         last_error TEXT,
@@ -130,6 +135,7 @@ function ensure_schema(SQLite3 $db): void
     )');
 
     ensure_table_columns($db, 'instances', [
+        'torrent_count' => 'INTEGER DEFAULT 0',
         'status' => 'TEXT DEFAULT "unknown"',
         'last_error' => 'TEXT',
         'last_attempt' => 'DATETIME',
@@ -145,6 +151,13 @@ function ensure_schema(SQLite3 $db): void
     ]);
 
     $db->exec("UPDATE instances SET status = 'unknown' WHERE status IS NULL OR status = ''");
+    $db->exec('UPDATE instances
+        SET torrent_count = (
+            SELECT COUNT(*)
+            FROM torrents
+            WHERE torrents.instance_name = instances.name
+        )
+        WHERE torrent_count IS NULL');
     $db->exec('UPDATE instances SET last_success = last_update WHERE last_success IS NULL AND last_update IS NOT NULL');
     $db->exec('UPDATE instances SET last_attempt = last_update WHERE last_attempt IS NULL AND last_update IS NOT NULL');
 
@@ -188,7 +201,7 @@ function ensure_indexes(SQLite3 $db): void
     $db->exec('CREATE INDEX IF NOT EXISTS idx_category_history_timestamp ON category_history (timestamp)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_category_history_timestamp_category ON category_history (timestamp, category)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_categories_category ON categories (category)');
-    $db->exec('CREATE INDEX IF NOT EXISTS idx_torrents_instance ON torrents (instance_name)');
+    $db->exec('DROP INDEX IF EXISTS idx_torrents_instance');
 }
 
 function get_latest_update(SQLite3 $db): ?string

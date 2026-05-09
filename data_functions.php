@@ -78,6 +78,7 @@ function get_current_data(SQLite3 $db, array $config, array $refreshMeta = []): 
             'ok_count' => $okCount,
             'error_count' => $errorCount,
             'is_stale' => is_refresh_needed($db, $config),
+            'dashboard_poll_interval_seconds' => $settings['dashboard_poll_interval_seconds'],
             'history_hours_default' => $settings['history_hours_default'],
             'history_hours_options' => $settings['history_hours_options'],
             'refresh_ttl_seconds' => $settings['refresh_ttl_seconds'],

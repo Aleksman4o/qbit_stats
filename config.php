@@ -45,7 +45,8 @@ function parseClientsConfig() {
         'instances' => $instances,
         'db_path' => __DIR__ . '/qbittorrent_stats.db',
         'settings' => [
-            'refresh_ttl_seconds' => 60,
+            'refresh_ttl_seconds' => 30,
+            'dashboard_poll_interval_seconds' => 30,
             'history_hours_default' => 6,
             'history_hours_options' => [1, 6, 24],
             'history_retention_days' => 7,
