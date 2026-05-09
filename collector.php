@@ -1197,38 +1197,6 @@ function upsert_category_rows(SQLite3 $db, string $instanceName, string $snapsho
     }
 }
 
-function load_all_current_categories(SQLite3 $db, string $instanceName): array
-{
-    $stmt = $db->prepare('SELECT
-        category,
-        active_torrents,
-        dl_speed,
-        up_speed,
-        total_size,
-        uploaded_session,
-        uploaded_total
-        FROM categories
-        WHERE instance_name = :instance_name
-        ORDER BY category ASC');
-    $stmt->bindValue(':instance_name', $instanceName, SQLITE3_TEXT);
-    $result = $stmt->execute();
-    $rows = [];
-
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $rows[] = [
-            'category' => $row['category'],
-            'active_torrents' => (int)$row['active_torrents'],
-            'dl_speed' => (int)$row['dl_speed'],
-            'up_speed' => (int)$row['up_speed'],
-            'total_size' => (int)$row['total_size'],
-            'uploaded_session' => (int)$row['uploaded_session'],
-            'uploaded_total' => (int)$row['uploaded_total'],
-        ];
-    }
-
-    return $rows;
-}
-
 function insert_category_history_snapshot(SQLite3 $db, string $instanceName, string $snapshotTime): void
 {
     $stmt = $db->prepare('INSERT INTO category_history
