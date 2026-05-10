@@ -67,10 +67,31 @@ $defaultHistoryHours = $historyData['hours'];
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>qBittorrent Category Monitor</title>
+    <script>
+        (function () {
+            const storageKey = 'qbitStatsTheme';
+            let theme = 'light';
+
+            try {
+                const storedTheme = localStorage.getItem(storageKey);
+                if (storedTheme === 'light' || storedTheme === 'dark') {
+                    theme = storedTheme;
+                } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                    theme = 'dark';
+                }
+            } catch (error) {
+            }
+
+            document.documentElement.dataset.theme = theme;
+        }());
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
+            color-scheme: light;
             --bg: #eef2eb;
+            --bg-top: #f4f7f0;
+            --bg-accent-glow: rgba(30, 122, 71, 0.10);
             --panel: #f9fbf7;
             --panel-strong: #ffffff;
             --border: #d7e0d1;
@@ -78,11 +99,68 @@ $defaultHistoryHours = $historyData['hours'];
             --muted: #607062;
             --accent: #1e7a47;
             --accent-soft: rgba(30, 122, 71, 0.12);
+            --accent-border: rgba(30, 122, 71, 0.18);
             --warning: #9a6b00;
             --warning-soft: rgba(154, 107, 0, 0.12);
+            --warning-border: rgba(154, 107, 0, 0.18);
             --danger: #b8453b;
             --danger-soft: rgba(184, 69, 59, 0.12);
+            --danger-border: rgba(184, 69, 59, 0.18);
+            --info: #1f5b8b;
+            --info-soft: rgba(31, 91, 139, 0.12);
+            --info-border: rgba(31, 91, 139, 0.18);
+            --input-bg: #ffffff;
+            --input-text: #1f2a1f;
+            --button-shadow: 0 10px 18px rgba(30, 122, 71, 0.18);
+            --table-border: rgba(215, 224, 209, 0.95);
+            --row-hover: rgba(30, 122, 71, 0.04);
+            --sort-idle: #b7c2b2;
+            --sort-active: #7d8c7d;
+            --overlay-panel: rgba(255, 255, 255, 0.95);
+            --chart-grid: rgba(134, 151, 136, 0.22);
+            --chart-text: #607062;
+            --chart-tooltip-bg: rgba(23, 32, 24, 0.94);
+            --chart-tooltip-text: #f6faf5;
+            --chart-tooltip-border: rgba(110, 132, 112, 0.26);
             --shadow: 0 18px 40px rgba(34, 54, 35, 0.08);
+        }
+
+        :root[data-theme="dark"] {
+            color-scheme: dark;
+            --bg: #070b09;
+            --bg-top: #0d1310;
+            --bg-accent-glow: rgba(90, 193, 126, 0.10);
+            --panel: #0f1512;
+            --panel-strong: #141c17;
+            --border: #202c24;
+            --text: #edf3eb;
+            --muted: #94a497;
+            --accent: #63cc88;
+            --accent-soft: rgba(99, 204, 136, 0.16);
+            --accent-border: rgba(99, 204, 136, 0.24);
+            --warning: #e2b65d;
+            --warning-soft: rgba(226, 182, 93, 0.14);
+            --warning-border: rgba(226, 182, 93, 0.24);
+            --danger: #ef867a;
+            --danger-soft: rgba(239, 134, 122, 0.16);
+            --danger-border: rgba(239, 134, 122, 0.24);
+            --info: #7dc0f4;
+            --info-soft: rgba(125, 192, 244, 0.16);
+            --info-border: rgba(125, 192, 244, 0.24);
+            --input-bg: #0b100d;
+            --input-text: #edf3eb;
+            --button-shadow: 0 14px 24px rgba(0, 0, 0, 0.38);
+            --table-border: rgba(42, 55, 46, 0.92);
+            --row-hover: rgba(99, 204, 136, 0.07);
+            --sort-idle: #536458;
+            --sort-active: #d7e2d9;
+            --overlay-panel: rgba(14, 19, 16, 0.97);
+            --chart-grid: rgba(104, 123, 110, 0.18);
+            --chart-text: #adbcaf;
+            --chart-tooltip-bg: rgba(12, 17, 14, 0.98);
+            --chart-tooltip-text: #edf3eb;
+            --chart-tooltip-border: rgba(87, 107, 93, 0.34);
+            --shadow: 0 24px 56px rgba(0, 0, 0, 0.42);
         }
 
         * {
@@ -93,8 +171,8 @@ $defaultHistoryHours = $historyData['hours'];
             margin: 0;
             padding: 28px;
             background:
-                radial-gradient(circle at top left, rgba(30, 122, 71, 0.10), transparent 30%),
-                linear-gradient(180deg, #f4f7f0 0%, var(--bg) 100%);
+                radial-gradient(circle at top left, var(--bg-accent-glow), transparent 30%),
+                linear-gradient(180deg, var(--bg-top) 0%, var(--bg) 100%);
             color: var(--text);
             font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
         }
@@ -141,6 +219,23 @@ $defaultHistoryHours = $historyData['hours'];
             align-items: flex-end;
         }
 
+        .theme-toggle {
+            padding: 9px 14px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: var(--panel-strong);
+            color: var(--text);
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+            transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+        }
+
+        .theme-toggle:hover {
+            transform: translateY(-1px);
+            border-color: var(--accent-border);
+        }
+
         .panel {
             background: linear-gradient(180deg, var(--panel-strong) 0%, var(--panel) 100%);
             border: 1px solid var(--border);
@@ -172,6 +267,10 @@ $defaultHistoryHours = $historyData['hours'];
             font-size: 0.94rem;
         }
 
+        .toolbar input[type="checkbox"] {
+            accent-color: var(--accent);
+        }
+
         .toolbar select,
         .toolbar button {
             border-radius: 12px;
@@ -182,8 +281,8 @@ $defaultHistoryHours = $historyData['hours'];
         .toolbar select {
             min-width: 90px;
             padding: 10px 12px;
-            background: #fff;
-            color: var(--text);
+            background: var(--input-bg);
+            color: var(--input-text);
         }
 
         .toolbar button {
@@ -192,7 +291,7 @@ $defaultHistoryHours = $historyData['hours'];
             color: #fff;
             cursor: pointer;
             transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
-            box-shadow: 0 10px 18px rgba(30, 122, 71, 0.18);
+            box-shadow: var(--button-shadow);
         }
 
         .toolbar button.secondary {
@@ -224,25 +323,25 @@ $defaultHistoryHours = $historyData['hours'];
         .badge.success {
             color: var(--accent);
             background: var(--accent-soft);
-            border-color: rgba(30, 122, 71, 0.18);
+            border-color: var(--accent-border);
         }
 
         .badge.warning {
             color: var(--warning);
             background: var(--warning-soft);
-            border-color: rgba(154, 107, 0, 0.18);
+            border-color: var(--warning-border);
         }
 
         .badge.error {
             color: var(--danger);
             background: var(--danger-soft);
-            border-color: rgba(184, 69, 59, 0.18);
+            border-color: var(--danger-border);
         }
 
         .badge.working {
-            color: #1f5b8b;
-            background: rgba(31, 91, 139, 0.12);
-            border-color: rgba(31, 91, 139, 0.18);
+            color: var(--info);
+            background: var(--info-soft);
+            border-color: var(--info-border);
         }
 
         .status-line {
@@ -334,7 +433,7 @@ $defaultHistoryHours = $historyData['hours'];
         td {
             padding: 12px 14px;
             text-align: left;
-            border-bottom: 1px solid rgba(215, 224, 209, 0.95);
+            border-bottom: 1px solid var(--table-border);
             white-space: nowrap;
         }
 
@@ -366,7 +465,7 @@ $defaultHistoryHours = $historyData['hours'];
             height: 0;
             border-left: 5px solid transparent;
             border-right: 5px solid transparent;
-            border-bottom: 6px solid #b7c2b2;
+            border-bottom: 6px solid var(--sort-idle);
             opacity: 0;
             transition: opacity 0.15s ease;
         }
@@ -378,11 +477,11 @@ $defaultHistoryHours = $historyData['hours'];
 
         .sort-arrow.desc {
             border-bottom: none;
-            border-top: 6px solid #7d8c7d;
+            border-top: 6px solid var(--sort-active);
         }
 
         tbody tr:hover {
-            background: rgba(30, 122, 71, 0.04);
+            background: var(--row-hover);
         }
 
         .muted {
@@ -423,7 +522,7 @@ $defaultHistoryHours = $historyData['hours'];
             padding: 14px 16px;
             border-radius: 16px;
             border: 1px solid var(--border);
-            background: rgba(255, 255, 255, 0.95);
+            background: var(--overlay-panel);
             box-shadow: var(--shadow);
             color: var(--text);
             opacity: 0;
@@ -438,11 +537,11 @@ $defaultHistoryHours = $historyData['hours'];
         }
 
         .status-message.success {
-            border-color: rgba(30, 122, 71, 0.18);
+            border-color: var(--accent-border);
         }
 
         .status-message.error {
-            border-color: rgba(184, 69, 59, 0.18);
+            border-color: var(--danger-border);
         }
 
         @media (max-width: 1240px) {
@@ -507,6 +606,7 @@ $defaultHistoryHours = $historyData['hours'];
                 <p class="subtitle">Дашборд сам собирает свежий срез, пока открыт. Наведите мышь на таймлайн, для мгновенного просмотра состава категорий в конкретный момент.</p>
             </div>
             <div class="header-meta">
+                <button id="themeToggleButton" type="button" class="theme-toggle">Тема</button>
                 <span id="refreshBadge" class="badge success">Срез актуален</span>
                 <span id="lastUpdateText" class="status-line">Последний срез: <?= htmlspecialchars($currentData['last_update'] ?? 'нет данных', ENT_QUOTES) ?></span>
             </div>
@@ -702,6 +802,7 @@ $defaultHistoryHours = $historyData['hours'];
         let categorySortState = loadCategorySortState();
 
         const categoryCache = new Map();
+        const themeStorageKey = 'qbitStatsTheme';
         if (currentData.last_update) {
             categoryCache.set(currentData.last_update, currentData.categories);
         }
@@ -776,6 +877,102 @@ $defaultHistoryHours = $historyData['hours'];
             });
         }
 
+        function getCurrentTheme() {
+            return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+        }
+
+        function readThemeVar(name) {
+            return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        }
+
+        function updateThemeToggle(theme) {
+            const button = document.getElementById('themeToggleButton');
+            if (!button) {
+                return;
+            }
+
+            const isDark = theme === 'dark';
+            button.textContent = `Тема: ${isDark ? 'тёмная' : 'светлая'}`;
+            button.title = isDark ? 'Переключить на светлую тему' : 'Переключить на тёмную тему';
+            button.setAttribute('aria-pressed', isDark ? 'true' : 'false');
+        }
+
+        function applyThemeToCharts() {
+            const chartText = readThemeVar('--chart-text');
+            const chartGrid = readThemeVar('--chart-grid');
+            const tooltipBackground = readThemeVar('--chart-tooltip-bg');
+            const tooltipText = readThemeVar('--chart-tooltip-text');
+            const tooltipBorder = readThemeVar('--chart-tooltip-border');
+
+            if (historyChartInstance) {
+                historyChartInstance.options.scales.x.ticks = {
+                    ...(historyChartInstance.options.scales.x.ticks || {}),
+                    color: chartText,
+                };
+                historyChartInstance.options.scales.y.ticks = {
+                    ...(historyChartInstance.options.scales.y.ticks || {}),
+                    color: chartText,
+                };
+                historyChartInstance.options.scales.y.grid = {
+                    ...(historyChartInstance.options.scales.y.grid || {}),
+                    color: chartGrid,
+                };
+                historyChartInstance.options.plugins.legend.labels = {
+                    ...(historyChartInstance.options.plugins.legend.labels || {}),
+                    color: chartText,
+                };
+                historyChartInstance.options.plugins.tooltip = {
+                    ...(historyChartInstance.options.plugins.tooltip || {}),
+                    backgroundColor: tooltipBackground,
+                    titleColor: tooltipText,
+                    bodyColor: tooltipText,
+                    borderColor: tooltipBorder,
+                    borderWidth: 1,
+                };
+                historyChartInstance.update('none');
+            }
+
+            if (categoryChartInstance) {
+                categoryChartInstance.options.scales.x.ticks = {
+                    ...(categoryChartInstance.options.scales.x.ticks || {}),
+                    color: chartText,
+                };
+                categoryChartInstance.options.scales.x.grid = {
+                    ...(categoryChartInstance.options.scales.x.grid || {}),
+                    color: chartGrid,
+                };
+                categoryChartInstance.options.scales.y.ticks = {
+                    ...(categoryChartInstance.options.scales.y.ticks || {}),
+                    color: chartText,
+                };
+                categoryChartInstance.options.plugins.tooltip = {
+                    ...(categoryChartInstance.options.plugins.tooltip || {}),
+                    backgroundColor: tooltipBackground,
+                    titleColor: tooltipText,
+                    bodyColor: tooltipText,
+                    borderColor: tooltipBorder,
+                    borderWidth: 1,
+                };
+                categoryChartInstance.update('none');
+            }
+        }
+
+        function applyTheme(theme, options = {}) {
+            const persist = options.persist !== false;
+            const nextTheme = theme === 'dark' ? 'dark' : 'light';
+            document.documentElement.dataset.theme = nextTheme;
+
+            if (persist) {
+                try {
+                    localStorage.setItem(themeStorageKey, nextTheme);
+                } catch (error) {
+                }
+            }
+
+            updateThemeToggle(nextTheme);
+            applyThemeToCharts();
+        }
+
         function getStatusClass(status) {
             if (status === 'ok') {
                 return 'ok';
@@ -795,11 +992,12 @@ $defaultHistoryHours = $historyData['hours'];
                 hash |= 0;
             }
 
-            const red = Math.abs((hash * 53) % 200) + 20;
-            const green = Math.abs((hash * 97) % 180) + 30;
-            const blue = Math.abs((hash * 131) % 160) + 40;
+            const theme = getCurrentTheme();
+            const hue = Math.abs(hash) % 360;
+            const saturation = theme === 'dark' ? 76 : 82;
+            const lightness = theme === 'dark' ? 60 : 46;
 
-            return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+            return `hsla(${hue}, ${saturation}%, ${lightness}%, ${alpha})`;
         }
 
         function computeCategoryTotals(categories) {
@@ -913,7 +1111,6 @@ $defaultHistoryHours = $historyData['hours'];
                 stack: 'upload',
                 pointRadius: 0,
                 pointHoverRadius: 4,
-                borderDash: [5, 4],
             }));
 
             return {
@@ -1462,8 +1659,10 @@ $defaultHistoryHours = $historyData['hours'];
         }
 
         function boot() {
+            updateThemeToggle(getCurrentTheme());
             renderHistoryChart();
             renderCategoryChart(currentData.categories);
+            applyThemeToCharts();
             renderInstancesTable();
             updateInstancesHealth();
             updateRefreshStatus();
@@ -1475,6 +1674,7 @@ $defaultHistoryHours = $historyData['hours'];
             const autoRefreshCheckbox = document.getElementById('autoRefreshCheckbox');
             const historyHoursSelect = document.getElementById('historyHoursSelect');
             const clearSelectionButton = document.getElementById('clearSelectionButton');
+            const themeToggleButton = document.getElementById('themeToggleButton');
 
             const storedAutoRefresh = localStorage.getItem('qbitStatsAutoRefresh');
             const autoRefreshEnabled = storedAutoRefresh === null ? true : storedAutoRefresh === 'true';
@@ -1483,6 +1683,10 @@ $defaultHistoryHours = $historyData['hours'];
 
             refreshButton.addEventListener('click', () => {
                 refreshDashboard({ force: true });
+            });
+
+            themeToggleButton.addEventListener('click', () => {
+                applyTheme(getCurrentTheme() === 'dark' ? 'light' : 'dark');
             });
 
             autoRefreshCheckbox.addEventListener('change', event => {
