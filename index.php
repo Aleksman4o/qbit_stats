@@ -893,6 +893,7 @@ $defaultHistoryHours = $historyData['hours'];
 
         const categoryCache = new Map();
         const themeStorageKey = 'qbitStatsTheme';
+        const categoryHistoryLegendStorageKey = 'qbitStatsCategoryHistoryLegendVisible';
         if (currentData.last_update) {
             categoryCache.set(currentData.last_update, currentData.categories);
         }
@@ -1486,6 +1487,21 @@ $defaultHistoryHours = $historyData['hours'];
             button.setAttribute('aria-expanded', visible ? 'true' : 'false');
         }
 
+        function loadCategoryHistoryLegendVisible() {
+            try {
+                return localStorage.getItem(categoryHistoryLegendStorageKey) !== 'false';
+            } catch (error) {
+                return true;
+            }
+        }
+
+        function saveCategoryHistoryLegendVisible(visible) {
+            try {
+                localStorage.setItem(categoryHistoryLegendStorageKey, String(visible));
+            } catch (error) {
+            }
+        }
+
         function renderCategoryUploadHistoryChart() {
             const model = buildCategoryUploadHistoryModel(historyPayload.category_upload_history || {});
             const context = document.getElementById('categoryHistoryChart').getContext('2d');
@@ -2068,6 +2084,8 @@ $defaultHistoryHours = $historyData['hours'];
             const themeToggleButton = document.getElementById('themeToggleButton');
             const categoryHistoryLegendToggle = document.getElementById('categoryHistoryLegendToggle');
 
+            setCategoryHistoryLegendVisible(loadCategoryHistoryLegendVisible());
+
             const storedAutoRefresh = localStorage.getItem('qbitStatsAutoRefresh');
             const autoRefreshEnabled = storedAutoRefresh === null ? true : storedAutoRefresh === 'true';
             autoRefreshCheckbox.checked = autoRefreshEnabled;
@@ -2083,7 +2101,9 @@ $defaultHistoryHours = $historyData['hours'];
 
             categoryHistoryLegendToggle.addEventListener('click', () => {
                 const legend = document.getElementById('categoryHistoryLegend');
-                setCategoryHistoryLegendVisible(legend.hidden);
+                const nextVisible = legend.hidden;
+                setCategoryHistoryLegendVisible(nextVisible);
+                saveCategoryHistoryLegendVisible(nextVisible);
             });
 
             autoRefreshCheckbox.addEventListener('change', event => {
