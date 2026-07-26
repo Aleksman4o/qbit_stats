@@ -1,9 +1,18 @@
 <?php
-function parseClientsConfig() {
-    $iniCandidates = [
-        __DIR__ . '/../data/config.ini',
-        __DIR__ . '/../../data/config.ini',
-    ];
+function parseIniInteger($value): ?int
+{
+    $parsed = filter_var($value, FILTER_VALIDATE_INT);
+
+    return $parsed === false ? null : $parsed;
+}
+
+function parseClientsConfig(?string $iniFileOverride = null) {
+    $iniCandidates = $iniFileOverride !== null
+        ? [$iniFileOverride]
+        : [
+            __DIR__ . '/../data/config.ini',
+            __DIR__ . '/../../data/config.ini',
+        ];
     $iniFile = null;
 
     foreach ($iniCandidates as $candidate) {
@@ -24,6 +33,15 @@ function parseClientsConfig() {
         throw new Exception("Failed to parse INI file. Check file syntax.");
     }
 
+    $lastActiveClientId = null;
+    if (array_key_exists('qt', $iniContent['other'] ?? [])) {
+        $lastActiveClientId = parseIniInteger($iniContent['other']['qt']);
+
+        if ($lastActiveClientId === null || $lastActiveClientId < 0) {
+            throw new Exception("Invalid [other] qt in config.ini. Expected a non-negative client ID.");
+        }
+    }
+
     $instances = [];
     foreach ($iniContent as $section => $client) {
         // Пропускаем секции без обязательных полей
@@ -36,6 +54,11 @@ function parseClientsConfig() {
             continue;
         }
 
+        $clientId = parseIniInteger($client['id'] ?? null);
+        if ($lastActiveClientId !== null && ($clientId === null || $clientId > $lastActiveClientId)) {
+            continue;
+        }
+
         $protocol = ($client['ssl'] ?? 0) == 1 ? 'https://' : 'http://';
         $url = $protocol . $client['hostname'] . ':' . $client['port'];
         $verifyCert = (bool)($client['verify_cert'] ?? false);
@@ -45,7 +68,7 @@ function parseClientsConfig() {
             'url' => $url,
             'username' => $client['login'] ?? '',
             'password' => $client['password'] ?? '',
-            'id' => $client['id'] ?? null,
+            'id' => $clientId,
             'ssl' => (bool)($client['ssl'] ?? false),
             'verify_cert' => $verifyCert
         ];
@@ -71,6 +94,10 @@ function parseClientsConfig() {
             'lock_path' => __DIR__ . '/qbittorrent_stats.lock',
         ],
     ];
+}
+
+if (defined('QBIT_STATS_CONFIG_LIBRARY_ONLY') && QBIT_STATS_CONFIG_LIBRARY_ONLY) {
+    return null;
 }
 
 return parseClientsConfig();

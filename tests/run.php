@@ -1,5 +1,7 @@
 <?php
 
+define('QBIT_STATS_CONFIG_LIBRARY_ONLY', true);
+require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../collector.php';
 require_once __DIR__ . '/../data_functions.php';
 
@@ -29,6 +31,11 @@ if ($dbPath === false) {
     throw new RuntimeException('Unable to create a temporary database path');
 }
 
+$iniPath = tempnam(sys_get_temp_dir(), 'qbit_stats_ini_test_');
+if ($iniPath === false) {
+    throw new RuntimeException('Unable to create a temporary config path');
+}
+
 $config = [
     'db_path' => $dbPath,
     'instances' => [
@@ -41,7 +48,50 @@ $config = [
 ];
 
 try {
+    file_put_contents($iniPath, <<<'INI'
+[other]
+user_version="3"
+qt="7"
+
+[client-1]
+id="1"
+client="qbittorrent"
+hostname="one.example"
+port="8080"
+comment="one"
+
+[client-7]
+id="7"
+client="qbittorrent"
+hostname="seven.example"
+port="8080"
+comment="seven"
+
+[client-8]
+id="8"
+client="qbittorrent"
+hostname="eight.example"
+port="8080"
+comment="eight"
+
+[client-without-id]
+client="qbittorrent"
+hostname="unknown.example"
+port="8080"
+comment="unknown"
+INI);
+    $parsedClientsConfig = parseClientsConfig($iniPath);
+    assert_same(
+        ['one', 'seven'],
+        array_column($parsedClientsConfig['instances'], 'name'),
+        'Only qBittorrent clients up to and including [other] qt must be configured'
+    );
+
     $db = open_database($config);
+    assert_same(30, get_history_bucket_seconds(1), 'One-hour history must keep 30-second points');
+    assert_same(60, get_history_bucket_seconds(6), 'Six-hour history must use one-minute points');
+    assert_same(300, get_history_bucket_seconds(24), 'Twenty-four-hour history must use five-minute points');
+
     $db->exec("INSERT INTO instances
         (name, torrent_count, last_update, status, last_attempt, last_success)
         VALUES ('active', 3, '2026-01-01 00:00:00', 'ok', '2026-01-01 00:00:00', '2026-01-01 00:00:00')");
@@ -157,6 +207,67 @@ try {
         assert_same(count($allCategoryHistory['timestamps']), count($series['data']), 'Every category series must align with the shared timeline');
     }
 
+    $bucketStart = intdiv(time(), 300) * 300 - 600;
+    $sampleTimestamps = [
+        date('Y-m-d H:i:s', $bucketStart + 30),
+        date('Y-m-d H:i:s', $bucketStart + 120),
+        date('Y-m-d H:i:s', $bucketStart + 330),
+    ];
+    $sampleSpeedHistory = $db->prepare('INSERT INTO speed_history
+        (instance_name, dl_speed, up_speed, timestamp)
+        VALUES (:instance_name, :dl_speed, :up_speed, :timestamp)');
+    $sampleCategoryHistory = $db->prepare('INSERT INTO category_history
+        (instance_name, category, active_torrents, dl_speed, up_speed, total_size, uploaded_session, uploaded_total, timestamp)
+        VALUES (:instance_name, :category, 1, 0, :up_speed, 1, 1, 1, :timestamp)');
+
+    foreach ($sampleTimestamps as $index => $timestamp) {
+        $speed = $index + 1;
+        $sampleSpeedHistory->bindValue(':instance_name', 'active', SQLITE3_TEXT);
+        $sampleSpeedHistory->bindValue(':dl_speed', $speed, SQLITE3_INTEGER);
+        $sampleSpeedHistory->bindValue(':up_speed', $speed, SQLITE3_INTEGER);
+        $sampleSpeedHistory->bindValue(':timestamp', $timestamp, SQLITE3_TEXT);
+        $sampleSpeedHistory->execute();
+
+        $sampleCategoryHistory->bindValue(':instance_name', 'active', SQLITE3_TEXT);
+        $sampleCategoryHistory->bindValue(':category', 'sampled', SQLITE3_TEXT);
+        $sampleCategoryHistory->bindValue(':up_speed', $speed, SQLITE3_INTEGER);
+        $sampleCategoryHistory->bindValue(':timestamp', $timestamp, SQLITE3_TEXT);
+        $sampleCategoryHistory->execute();
+    }
+
+    $sampledHistory = get_history_data($db, $config, 24);
+    $sampledSpeedTimestamps = array_values(array_unique(array_column($sampledHistory['data'], 'timestamp')));
+    assert_same(false, in_array($sampleTimestamps[0], $sampledSpeedTimestamps, true), 'An older point in a five-minute bucket must be omitted');
+    assert_same(true, in_array($sampleTimestamps[1], $sampledSpeedTimestamps, true), 'The latest real point in a five-minute bucket must be retained');
+    assert_same(true, in_array($sampleTimestamps[2], $sampledSpeedTimestamps, true), 'The latest point from the next bucket must be retained');
+    assert_same(
+        $sampledSpeedTimestamps,
+        $sampledHistory['category_upload_history']['timestamps'],
+        'Instance and category charts must use the same sampled timestamps'
+    );
+
+    $newestOpenBucketTimestamp = date('Y-m-d H:i:s', $bucketStart + 360);
+    $sampleSpeedHistory->bindValue(':instance_name', 'active', SQLITE3_TEXT);
+    $sampleSpeedHistory->bindValue(':dl_speed', 4, SQLITE3_INTEGER);
+    $sampleSpeedHistory->bindValue(':up_speed', 4, SQLITE3_INTEGER);
+    $sampleSpeedHistory->bindValue(':timestamp', $newestOpenBucketTimestamp, SQLITE3_TEXT);
+    $sampleSpeedHistory->execute();
+    $sampleCategoryHistory->bindValue(':instance_name', 'active', SQLITE3_TEXT);
+    $sampleCategoryHistory->bindValue(':category', 'sampled', SQLITE3_TEXT);
+    $sampleCategoryHistory->bindValue(':up_speed', 4, SQLITE3_INTEGER);
+    $sampleCategoryHistory->bindValue(':timestamp', $newestOpenBucketTimestamp, SQLITE3_TEXT);
+    $sampleCategoryHistory->execute();
+
+    $updatedSampledHistory = get_history_data($db, $config, 24);
+    $updatedSpeedTimestamps = array_values(array_unique(array_column($updatedSampledHistory['data'], 'timestamp')));
+    assert_same(false, in_array($sampleTimestamps[2], $updatedSpeedTimestamps, true), 'The previous point from the open bucket must be replaced');
+    assert_same(true, in_array($newestOpenBucketTimestamp, $updatedSpeedTimestamps, true), 'A fresher point must update the open bucket');
+    assert_same(
+        $updatedSpeedTimestamps,
+        $updatedSampledHistory['category_upload_history']['timestamps'],
+        'Both chart timelines must remain aligned after a real-time update'
+    );
+
     $db->close();
     echo "All regression tests passed\n";
 } finally {
@@ -165,4 +276,7 @@ try {
     }
 
     remove_test_database($dbPath);
+    if (is_file($iniPath)) {
+        unlink($iniPath);
+    }
 }

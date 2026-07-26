@@ -1,5 +1,8 @@
 <?php
 
+const QBIT_STATS_VERSION = '0.6.3';
+const QBIT_STATS_LATEST_RELEASE_API_URL = 'https://api.github.com/repos/Aleksman4o/qbit_stats/releases/latest';
+
 $config = require __DIR__ . '/config.php';
 require_once __DIR__ . '/collector.php';
 require_once __DIR__ . '/data_functions.php';
@@ -197,6 +200,19 @@ $defaultHistoryHours = $historyData['hours'];
             text-transform: uppercase;
             color: var(--accent);
             font-weight: 700;
+        }
+
+        .release-status {
+            margin-left: 5px;
+            color: var(--muted);
+            font-weight: 600;
+            letter-spacing: normal;
+            text-transform: none;
+        }
+
+        .release-status a {
+            color: var(--accent);
+            text-underline-offset: 2px;
         }
 
         h1 {
@@ -675,7 +691,10 @@ $defaultHistoryHours = $historyData['hours'];
     <div class="page">
         <header class="page-header">
             <div>
-                <p class="eyebrow">qBit Stats V2</p>
+                <p class="eyebrow">
+                    qBit Stats V2
+                    <span id="releaseStatus" class="release-status" aria-live="polite" hidden></span>
+                </p>
                 <h1>Категории в реальном времени</h1>
                 <p class="subtitle">Дашборд сам собирает свежий срез, пока открыт. Наведите мышь на таймлайн, для мгновенного просмотра состава категорий в конкретный момент.</p>
             </div>
@@ -889,6 +908,8 @@ $defaultHistoryHours = $historyData['hours'];
         const currentDataSeed = <?= json_for_script($currentData) ?>;
         const historyPayloadSeed = <?= json_for_script($historyData) ?>;
         const instanceNames = <?= json_for_script(array_column($config['instances'], 'name')) ?>;
+        const installedVersion = <?= json_for_script(QBIT_STATS_VERSION) ?>;
+        const latestReleaseApiUrl = <?= json_for_script(QBIT_STATS_LATEST_RELEASE_API_URL) ?>;
 
         let currentData = currentDataSeed;
         let historyPayload = historyPayloadSeed;
@@ -915,6 +936,81 @@ $defaultHistoryHours = $historyData['hours'];
         }
 
         const pollIntervalMs = Math.max(5000, (currentData.meta.dashboard_poll_interval_seconds || 30) * 1000);
+
+        function parseVersionParts(value) {
+            const match = String(value || '').match(/\d+(?:\.\d+)*/);
+
+            return match ? match[0].split('.').map(part => Number(part) || 0) : [];
+        }
+
+        function compareVersions(left, right) {
+            const leftParts = parseVersionParts(left);
+            const rightParts = parseVersionParts(right);
+            const partCount = Math.max(leftParts.length, rightParts.length);
+
+            for (let index = 0; index < partCount; index++) {
+                const difference = (leftParts[index] || 0) - (rightParts[index] || 0);
+                if (difference !== 0) {
+                    return difference;
+                }
+            }
+
+            return 0;
+        }
+
+        async function checkLatestRelease() {
+            const status = document.getElementById('releaseStatus');
+            if (!status) {
+                return;
+            }
+
+            const abortController = new AbortController();
+            const timeout = window.setTimeout(() => abortController.abort(), 5000);
+
+            try {
+                const response = await fetch(latestReleaseApiUrl, {
+                    signal: abortController.signal,
+                });
+                if (!response.ok) {
+                    return;
+                }
+
+                const release = await response.json();
+                const latestVersion = String(release?.tag_name || release?.name || '');
+                if (!parseVersionParts(latestVersion).length) {
+                    return;
+                }
+
+                status.replaceChildren();
+                status.append('(');
+
+                if (compareVersions(installedVersion, latestVersion) >= 0) {
+                    status.append('последняя версия');
+                } else {
+                    const asset = Array.isArray(release.assets)
+                        ? release.assets.find(item => item?.name === 'qbit_stats.zip')
+                        : null;
+                    const downloadUrl = asset?.browser_download_url || release?.html_url;
+                    if (!downloadUrl) {
+                        return;
+                    }
+
+                    const link = document.createElement('a');
+                    link.href = downloadUrl;
+                    link.textContent = `скачать ${latestVersion}`;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                    status.append(link);
+                }
+
+                status.append(')');
+                status.title = `Установлена версия ${installedVersion}`;
+                status.hidden = false;
+            } catch (error) {
+            } finally {
+                window.clearTimeout(timeout);
+            }
+        }
 
         function formatSpeed(bytes) {
             const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
@@ -2365,6 +2461,8 @@ $defaultHistoryHours = $historyData['hours'];
                     refreshDashboard({ force: false });
                 }, 120);
             }
+
+            window.setTimeout(checkLatestRelease, 0);
         }
 
         boot();

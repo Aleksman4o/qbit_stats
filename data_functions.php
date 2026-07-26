@@ -98,6 +98,50 @@ function get_current_data(SQLite3 $db, array $config, array $refreshMeta = []): 
     ];
 }
 
+function get_history_bucket_seconds(int $hours): int
+{
+    if ($hours <= 1) {
+        return 30;
+    }
+
+    if ($hours <= 6) {
+        return 60;
+    }
+
+    return 300;
+}
+
+function get_sampled_history_timestamps(
+    SQLite3 $db,
+    array $instanceNames,
+    string $cutoff,
+    int $bucketSeconds
+): array {
+    if (empty($instanceNames)) {
+        return [];
+    }
+
+    $placeholders = create_sqlite_placeholders($instanceNames, 'sampled_history_instance_');
+    $stmt = $db->prepare('SELECT MAX(timestamp) AS timestamp
+        FROM speed_history
+        WHERE timestamp >= :cutoff
+          AND instance_name IN (' . implode(', ', $placeholders) . ')
+        GROUP BY CAST(strftime(\'%s\', timestamp) AS INTEGER) / :bucket_seconds
+        ORDER BY timestamp ASC');
+    $stmt->bindValue(':cutoff', $cutoff, SQLITE3_TEXT);
+    $stmt->bindValue(':bucket_seconds', $bucketSeconds, SQLITE3_INTEGER);
+    bind_sqlite_text_values($stmt, $instanceNames, 'sampled_history_instance_');
+
+    $result = $stmt->execute();
+    $timestamps = [];
+
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $timestamps[] = $row['timestamp'];
+    }
+
+    return $timestamps;
+}
+
 function get_history_data(SQLite3 $db, array $config, int $hours): array
 {
     $normalizedHours = normalize_history_hours($config, $hours);
@@ -117,18 +161,37 @@ function get_history_data(SQLite3 $db, array $config, int $hours): array
         ];
     }
 
+    $timestamps = get_sampled_history_timestamps(
+        $db,
+        $instanceNames,
+        $cutoff,
+        get_history_bucket_seconds($normalizedHours)
+    );
+
+    if (empty($timestamps)) {
+        return [
+            'hours' => $normalizedHours,
+            'data' => $rows,
+            'category_upload_history' => $categoryUploadHistory,
+        ];
+    }
+
+    $categoryUploadHistory['timestamps'] = $timestamps;
+    $timestampIndexes = array_flip($timestamps);
+
     $placeholders = create_sqlite_placeholders($instanceNames, 'history_instance_');
+    $timestampPlaceholders = create_sqlite_placeholders($timestamps, 'history_timestamp_');
     $stmt = $db->prepare('SELECT
         timestamp,
         instance_name,
         dl_speed,
         up_speed
         FROM speed_history
-        WHERE timestamp >= :cutoff
-          AND instance_name IN (' . implode(', ', $placeholders) . ')
+        WHERE instance_name IN (' . implode(', ', $placeholders) . ')
+          AND timestamp IN (' . implode(', ', $timestampPlaceholders) . ')
         ORDER BY timestamp ASC, instance_name ASC');
-    $stmt->bindValue(':cutoff', $cutoff, SQLITE3_TEXT);
     bind_sqlite_text_values($stmt, $instanceNames, 'history_instance_');
+    bind_sqlite_text_values($stmt, $timestamps, 'history_timestamp_');
 
     $result = $stmt->execute();
 
@@ -137,20 +200,20 @@ function get_history_data(SQLite3 $db, array $config, int $hours): array
     }
 
     $categoryPlaceholders = create_sqlite_placeholders($instanceNames, 'category_upload_instance_');
+    $categoryTimestampPlaceholders = create_sqlite_placeholders($timestamps, 'category_upload_timestamp_');
     $categoryStmt = $db->prepare('
         SELECT
             category_history.timestamp,
             category_history.category,
             SUM(category_history.up_speed) AS up_speed
         FROM category_history
-        WHERE category_history.timestamp >= :category_cutoff
-          AND category_history.instance_name IN (' . implode(', ', $categoryPlaceholders) . ')
+        WHERE category_history.instance_name IN (' . implode(', ', $categoryPlaceholders) . ')
+          AND category_history.timestamp IN (' . implode(', ', $categoryTimestampPlaceholders) . ')
         GROUP BY category_history.timestamp, category_history.category
         ORDER BY category_history.timestamp ASC, category_history.category ASC');
-    $categoryStmt->bindValue(':category_cutoff', $cutoff, SQLITE3_TEXT);
     bind_sqlite_text_values($categoryStmt, $instanceNames, 'category_upload_instance_');
+    bind_sqlite_text_values($categoryStmt, $timestamps, 'category_upload_timestamp_');
     $categoryResult = $categoryStmt->execute();
-    $timestampIndexes = [];
     $categoryPoints = [];
     $categoryTotals = [];
 
@@ -158,11 +221,6 @@ function get_history_data(SQLite3 $db, array $config, int $hours): array
         $timestamp = $row['timestamp'];
         $category = $row['category'];
         $upSpeed = (int)$row['up_speed'];
-
-        if (!isset($timestampIndexes[$timestamp])) {
-            $timestampIndexes[$timestamp] = count($categoryUploadHistory['timestamps']);
-            $categoryUploadHistory['timestamps'][] = $timestamp;
-        }
 
         $categoryPoints[$category][$timestampIndexes[$timestamp]] = $upSpeed;
         $categoryTotals[$category] = ($categoryTotals[$category] ?? 0) + $upSpeed;
