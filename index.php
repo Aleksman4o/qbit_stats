@@ -892,6 +892,7 @@ $defaultHistoryHours = $historyData['hours'];
         let categorySortState = loadCategorySortState();
 
         const categoryCache = new Map();
+        const categoryTooltipMarkerCache = new Map();
         const themeStorageKey = 'qbitStatsTheme';
         const categoryHistoryLegendStorageKey = 'qbitStatsCategoryHistoryLegendVisible';
         if (currentData.last_update) {
@@ -988,12 +989,26 @@ $defaultHistoryHours = $historyData['hours'];
             button.setAttribute('aria-pressed', isDark ? 'true' : 'false');
         }
 
-        function applyThemeToCharts() {
-            const chartText = readThemeVar('--chart-text');
-            const chartGrid = readThemeVar('--chart-grid');
-            const tooltipBackground = readThemeVar('--chart-tooltip-bg');
-            const tooltipText = readThemeVar('--chart-tooltip-text');
-            const tooltipBorder = readThemeVar('--chart-tooltip-border');
+        function getChartThemeColors() {
+            return {
+                chartText: readThemeVar('--chart-text'),
+                chartGrid: readThemeVar('--chart-grid'),
+                tooltipBackground: readThemeVar('--chart-tooltip-bg'),
+                tooltipText: readThemeVar('--chart-tooltip-text'),
+                tooltipBorder: readThemeVar('--chart-tooltip-border'),
+            };
+        }
+
+        function applyThemeToCharts(options = {}) {
+            const updateHistory = options.updateHistory !== false;
+            const updateCategoryHistory = options.updateCategoryHistory !== false;
+            const {
+                chartText,
+                chartGrid,
+                tooltipBackground,
+                tooltipText,
+                tooltipBorder,
+            } = getChartThemeColors();
 
             if (historyChartInstance) {
                 historyChartInstance.options.scales.x.ticks = {
@@ -1020,7 +1035,9 @@ $defaultHistoryHours = $historyData['hours'];
                     borderColor: tooltipBorder,
                     borderWidth: 1,
                 };
-                historyChartInstance.update('none');
+                if (updateHistory) {
+                    historyChartInstance.update('none');
+                }
             }
 
             if (categoryHistoryChartInstance) {
@@ -1048,7 +1065,9 @@ $defaultHistoryHours = $historyData['hours'];
                     borderColor: tooltipBorder,
                     borderWidth: 1,
                 };
-                categoryHistoryChartInstance.update('none');
+                if (updateCategoryHistory) {
+                    categoryHistoryChartInstance.update('none');
+                }
             }
 
             if (categoryChartInstance) {
@@ -1127,6 +1146,65 @@ $defaultHistoryHours = $historyData['hours'];
         function makeInstanceColor(instanceName, alpha) {
             const index = instanceNames.indexOf(instanceName);
             return makeDistinctSeriesColor(index >= 0 ? index : 0, alpha);
+        }
+
+        function resolveTooltipMarkerColor(context) {
+            const configuredColor = context.dataset.$tooltipColor
+                ?? context.dataset.borderColor
+                ?? context.dataset.backgroundColor;
+            return Array.isArray(configuredColor)
+                ? configuredColor[context.dataIndex]
+                : configuredColor;
+        }
+
+        function getTooltipMarkerColor(context) {
+            const color = resolveTooltipMarkerColor(context);
+            return {
+                backgroundColor: color,
+                borderColor: color,
+                borderWidth: 0,
+            };
+        }
+
+        function getTooltipMarkerStyle() {
+            return {
+                pointStyle: 'circle',
+                rotation: 0,
+            };
+        }
+
+        function getCategoryTooltipMarkerStyle(context) {
+            const color = resolveTooltipMarkerColor(context);
+            let marker = categoryTooltipMarkerCache.get(color);
+
+            if (!marker) {
+                marker = document.createElement('canvas');
+                marker.width = 9;
+                marker.height = 13;
+
+                const markerContext = marker.getContext('2d');
+                markerContext.fillStyle = color;
+                markerContext.beginPath();
+                markerContext.arc(4.5, 4.5, 4.25, 0, Math.PI * 2);
+                markerContext.fill();
+                categoryTooltipMarkerCache.set(color, marker);
+            }
+
+            return {
+                pointStyle: marker,
+                rotation: 0,
+            };
+        }
+
+        function getInitialYAxisAnimations() {
+            return {
+                y: {
+                    type: 'number',
+                    duration: 800,
+                    easing: 'easeOutQuart',
+                    from: context => context.chart.scales.y.getPixelForValue(0),
+                },
+            };
         }
 
         function computeCategoryTotals(categories) {
@@ -1227,6 +1305,7 @@ $defaultHistoryHours = $historyData['hours'];
                         const row = instancePoints.get(timestamp);
                         return row ? Number(row.dl_speed) || 0 : 0;
                     }),
+                    $tooltipColor: makeInstanceColor(instanceName, 1),
                     backgroundColor: makeInstanceColor(instanceName, 0.05),
                     borderColor: makeInstanceColor(instanceName, 0.72),
                     borderWidth: 1.5,
@@ -1248,6 +1327,7 @@ $defaultHistoryHours = $historyData['hours'];
                         const row = instancePoints.get(timestamp);
                         return row ? Number(row.up_speed) || 0 : 0;
                     }),
+                    $tooltipColor: makeInstanceColor(instanceName, 1),
                     backgroundColor: makeInstanceColor(instanceName, 0.12),
                     borderColor: makeInstanceColor(instanceName, 0.96),
                     borderWidth: 1.8,
@@ -1271,6 +1351,14 @@ $defaultHistoryHours = $historyData['hours'];
             const context = document.getElementById('historyChart').getContext('2d');
 
             if (!historyChartInstance) {
+                const {
+                    chartText,
+                    chartGrid,
+                    tooltipBackground,
+                    tooltipText,
+                    tooltipBorder,
+                } = getChartThemeColors();
+
                 historyChartInstance = new Chart(context, {
                     type: 'line',
                     data: {
@@ -1278,6 +1366,7 @@ $defaultHistoryHours = $historyData['hours'];
                         datasets: model.datasets,
                     },
                     options: {
+                        animations: getInitialYAxisAnimations(),
                         maintainAspectRatio: false,
                         responsive: true,
                         interaction: {
@@ -1290,12 +1379,19 @@ $defaultHistoryHours = $historyData['hours'];
                                 grid: {
                                     display: false,
                                 },
+                                ticks: {
+                                    color: chartText,
+                                },
                             },
                             y: {
                                 stacked: true,
                                 beginAtZero: true,
                                 ticks: {
+                                    color: chartText,
                                     callback: value => formatSpeed(value),
+                                },
+                                grid: {
+                                    color: chartGrid,
                                 },
                             },
                         },
@@ -1305,17 +1401,29 @@ $defaultHistoryHours = $historyData['hours'];
                                 labels: {
                                     boxWidth: 10,
                                     usePointStyle: true,
+                                    color: chartText,
                                 },
                             },
                             tooltip: {
                                 mode: 'index',
                                 intersect: false,
+                                usePointStyle: true,
+                                boxWidth: 9,
+                                boxHeight: 14,
+                                boxPadding: 4,
+                                backgroundColor: tooltipBackground,
+                                titleColor: tooltipText,
+                                bodyColor: tooltipText,
+                                borderColor: tooltipBorder,
+                                borderWidth: 1,
                                 callbacks: {
                                     title: items => {
                                         const timestamp = historyChartInstance?.$timestamps?.[items[0]?.dataIndex ?? -1];
                                         return formatTimestamp(timestamp);
                                     },
                                     label: context => `${context.dataset.label}: ${formatSpeed(context.raw)}`,
+                                    labelColor: getTooltipMarkerColor,
+                                    labelPointStyle: getTooltipMarkerStyle,
                                 },
                             },
                         },
@@ -1324,7 +1432,7 @@ $defaultHistoryHours = $historyData['hours'];
             } else {
                 historyChartInstance.data.labels = model.labels;
                 historyChartInstance.data.datasets = model.datasets;
-                historyChartInstance.update();
+                historyChartInstance.update('none');
             }
 
             historyChartInstance.$timestamps = model.timestamps;
@@ -1343,6 +1451,7 @@ $defaultHistoryHours = $historyData['hours'];
                     label: item.category,
                     data: smoothCategoryHistoryValues(rawData),
                     $rawData: rawData,
+                    $tooltipColor: makeDistinctSeriesColor(index, 1, 24),
                     borderColor: makeDistinctSeriesColor(index, 0.92, 24),
                     backgroundColor: makeDistinctSeriesColor(index, 0.08, 24),
                     borderWidth: 1.8,
@@ -1507,6 +1616,14 @@ $defaultHistoryHours = $historyData['hours'];
             const context = document.getElementById('categoryHistoryChart').getContext('2d');
 
             if (!categoryHistoryChartInstance) {
+                const {
+                    chartText,
+                    chartGrid,
+                    tooltipBackground,
+                    tooltipText,
+                    tooltipBorder,
+                } = getChartThemeColors();
+
                 categoryHistoryChartInstance = new Chart(context, {
                     type: 'line',
                     data: {
@@ -1514,7 +1631,7 @@ $defaultHistoryHours = $historyData['hours'];
                         datasets: model.datasets,
                     },
                     options: {
-                        animation: false,
+                        animations: getInitialYAxisAnimations(),
                         maintainAspectRatio: false,
                         responsive: true,
                         interaction: {
@@ -1527,11 +1644,18 @@ $defaultHistoryHours = $historyData['hours'];
                                 grid: {
                                     display: false,
                                 },
+                                ticks: {
+                                    color: chartText,
+                                },
                             },
                             y: {
                                 beginAtZero: true,
                                 ticks: {
+                                    color: chartText,
                                     callback: value => formatSpeed(value),
+                                },
+                                grid: {
+                                    color: chartGrid,
                                 },
                             },
                         },
@@ -1542,6 +1666,15 @@ $defaultHistoryHours = $historyData['hours'];
                             tooltip: {
                                 mode: 'index',
                                 intersect: false,
+                                usePointStyle: true,
+                                boxWidth: 9,
+                                boxHeight: 14,
+                                boxPadding: 4,
+                                backgroundColor: tooltipBackground,
+                                titleColor: tooltipText,
+                                bodyColor: tooltipText,
+                                borderColor: tooltipBorder,
+                                borderWidth: 1,
                                 filter: context => getCategoryTooltipDatasetIndexes(
                                     context.chart,
                                     context.dataIndex,
@@ -1559,6 +1692,8 @@ $defaultHistoryHours = $historyData['hours'];
                                     label: context => `${context.dataset.label}: ${formatSpeed(
                                         getCategoryHistoryRawValue(context.dataset, context.dataIndex)
                                     )}`,
+                                    labelColor: getTooltipMarkerColor,
+                                    labelPointStyle: getCategoryTooltipMarkerStyle,
                                 },
                             },
                         },
@@ -1588,6 +1723,7 @@ $defaultHistoryHours = $historyData['hours'];
                 datasets: [{
                     label: 'Upload',
                     data: topCategories.map(category => Number(category.up_speed) || 0),
+                    $tooltipColor: topCategories.map(category => makeColor(category.category, 1)),
                     backgroundColor: topCategories.map(category => makeColor(category.category, 0.28)),
                     borderColor: topCategories.map(category => makeColor(category.category, 0.92)),
                     borderWidth: 1.4,
@@ -1624,8 +1760,13 @@ $defaultHistoryHours = $historyData['hours'];
                                 display: false,
                             },
                             tooltip: {
+                                usePointStyle: true,
+                                boxWidth: 9,
+                                boxHeight: 14,
                                 callbacks: {
                                     label: context => formatSpeed(context.raw),
+                                    labelColor: getTooltipMarkerColor,
+                                    labelPointStyle: getTooltipMarkerStyle,
                                 },
                             },
                         },
@@ -2069,7 +2210,10 @@ $defaultHistoryHours = $historyData['hours'];
             renderHistoryChart();
             renderCategoryUploadHistoryChart();
             renderCategoryChart(currentData.categories);
-            applyThemeToCharts();
+            applyThemeToCharts({
+                updateHistory: false,
+                updateCategoryHistory: false,
+            });
             renderInstancesTable();
             updateInstancesHealth();
             updateRefreshStatus();
