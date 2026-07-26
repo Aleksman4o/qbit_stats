@@ -201,6 +201,7 @@ function fetch_instance_snapshots(array $config, array $instanceStates): array
 {
     $results = [];
     $parallelRequests = [];
+    $loginRequests = [];
 
     foreach ($config['instances'] as $instance) {
         $name = $instance['name'];
@@ -212,75 +213,78 @@ function fetch_instance_snapshots(array $config, array $instanceStates): array
                 'instance' => $instance,
                 'state' => $state,
                 'debug' => $debugInfo,
+                'sid_cookie' => $state['stored_sid'],
             ];
 
             continue;
         }
 
-        try {
-            $results[$name] = fetch_instance_remote_snapshot($config, $instance, $state, $debugInfo);
-        } catch (Throwable $e) {
+        $loginRequests[$name] = [
+            'instance' => $instance,
+            'state' => $state,
+            'debug' => $debugInfo,
+        ];
+    }
+
+    $loginResponses = fetch_parallel_login_responses($config, $loginRequests, 'initial');
+
+    foreach ($loginRequests as $name => $request) {
+        $response = $loginResponses[$name] ?? null;
+        if ($response === null) {
             $results[$name] = [
-                'error' => truncate_error_message($e->getMessage()),
-                'debug' => $debugInfo,
+                'error' => 'Parallel login request did not return a response',
+                'debug' => $request['debug'],
             ];
+            continue;
         }
+
+        if ($response['error'] !== null) {
+            $results[$name] = [
+                'error' => truncate_error_message($response['error']),
+                'debug' => $response['debug'],
+            ];
+            continue;
+        }
+
+        $parallelRequests[$name] = [
+            'instance' => $request['instance'],
+            'state' => $request['state'],
+            'debug' => $response['debug'],
+            'sid_cookie' => $response['sid_cookie'],
+        ];
     }
 
     $parallelResponses = fetch_parallel_sync_responses($config, $parallelRequests);
+    $reauthRequests = [];
 
     foreach ($parallelRequests as $name => $request) {
-        $instance = $request['instance'];
-        $state = $request['state'];
         $debugInfo = $request['debug'];
+        $response = $parallelResponses[$name] ?? null;
+
+        if (
+            $response !== null
+            && $response['error'] === null
+            && in_array($response['http_code'], [401, 403], true)
+        ) {
+            $reauthRequests[$name] = [
+                'instance' => $request['instance'],
+                'state' => $request['state'],
+                'debug' => $response['debug'],
+                'sid_cookie' => $request['sid_cookie'],
+            ];
+            unset($parallelResponses[$name]);
+            continue;
+        }
 
         try {
-            $response = $parallelResponses[$name] ?? null;
-            if ($response === null) {
-                throw new RuntimeException('Parallel sync request did not return a response');
-            }
-
-            $debugInfo = $response['debug'];
-            if ($response['error'] !== null) {
-                throw new RuntimeException($response['error']);
-            }
-
-            if (in_array($response['http_code'], [401, 403], true)) {
-                $results[$name] = fetch_instance_remote_snapshot($config, $instance, $state, $debugInfo);
-                continue;
-            }
-
-            if ($response['http_code'] >= 400) {
-                throw new RuntimeException(sprintf(
-                    'sync/maindata failed for %s (HTTP %d)',
-                    $name,
-                    $response['http_code']
-                ));
-            }
-
-            $mainData = decode_json_response($response['body'], 'sync/maindata', $name);
-            $headers = create_instance_headers($instance);
-            $settings = get_monitor_settings($config);
-            $verifyCert = $instance['verify_cert'] ?? false;
-            $sidCookie = $state['stored_sid'];
-            $transfer = [];
-
-            if (needs_transfer_fallback($mainData)) {
-                $transfer = fetch_json_with_reauth(
-                    $settings,
-                    $instance,
-                    $verifyCert,
-                    $instance['url'] . '/api/v2/transfer/info',
-                    'transfer/info',
-                    'transfer',
-                    $headers,
-                    $sidCookie,
-                    $debugInfo
-                );
-            }
-
+            $snapshot = build_snapshot_from_parallel_sync_response(
+                $config,
+                $request,
+                $response,
+                $debugInfo
+            );
             $results[$name] = [
-                'snapshot' => build_instance_snapshot($state, $sidCookie, $mainData, $transfer),
+                'snapshot' => $snapshot,
                 'debug' => $debugInfo,
             ];
         } catch (Throwable $e) {
@@ -289,12 +293,307 @@ function fetch_instance_snapshots(array $config, array $instanceStates): array
                 'debug' => $debugInfo,
             ];
         }
+
+        unset($parallelResponses[$name]);
+    }
+
+    $reauthLoginResponses = fetch_parallel_login_responses($config, $reauthRequests, 'reauth-sync');
+    $retryRequests = [];
+
+    foreach ($reauthRequests as $name => $request) {
+        $response = $reauthLoginResponses[$name] ?? null;
+        if ($response === null) {
+            $results[$name] = [
+                'error' => 'Parallel reauth request did not return a response',
+                'debug' => $request['debug'],
+            ];
+            continue;
+        }
+
+        if ($response['error'] !== null) {
+            $results[$name] = [
+                'error' => truncate_error_message($response['error']),
+                'debug' => $response['debug'],
+            ];
+            continue;
+        }
+
+        $retryRequests[$name] = [
+            'instance' => $request['instance'],
+            'state' => $request['state'],
+            'debug' => $response['debug'],
+            'sid_cookie' => $response['sid_cookie'],
+        ];
+    }
+
+    $retryResponses = fetch_parallel_sync_responses($config, $retryRequests, true);
+
+    foreach ($retryRequests as $name => $request) {
+        $debugInfo = $request['debug'];
+        $response = $retryResponses[$name] ?? null;
+
+        try {
+            $snapshot = build_snapshot_from_parallel_sync_response(
+                $config,
+                $request,
+                $response,
+                $debugInfo
+            );
+            $results[$name] = [
+                'snapshot' => $snapshot,
+                'debug' => $debugInfo,
+            ];
+        } catch (Throwable $e) {
+            $results[$name] = [
+                'error' => truncate_error_message($e->getMessage()),
+                'debug' => $debugInfo,
+            ];
+        }
+
+        unset($retryResponses[$name]);
     }
 
     return $results;
 }
 
-function fetch_parallel_sync_responses(array $config, array $requests): array
+function build_snapshot_from_parallel_sync_response(
+    array $config,
+    array $request,
+    ?array $response,
+    array &$debugInfo
+): array {
+    $instance = $request['instance'];
+    $state = $request['state'];
+
+    if ($response === null) {
+        throw new RuntimeException('Parallel sync request did not return a response');
+    }
+
+    $debugInfo = $response['debug'];
+    if ($response['error'] !== null) {
+        throw new RuntimeException($response['error']);
+    }
+
+    if ($response['http_code'] >= 400) {
+        throw new RuntimeException(sprintf(
+            'sync/maindata failed for %s (HTTP %d)',
+            $instance['name'],
+            $response['http_code']
+        ));
+    }
+
+    $mainData = $response['main_data'];
+    if (!is_array($mainData)) {
+        throw new RuntimeException(sprintf(
+            'sync/maindata returned no data for %s',
+            $instance['name']
+        ));
+    }
+
+    $headers = create_instance_headers($instance);
+    $settings = get_monitor_settings($config);
+    $verifyCert = $instance['verify_cert'] ?? false;
+    $sidCookie = $request['sid_cookie'] ?? $state['stored_sid'];
+    $transfer = [];
+
+    if (needs_transfer_fallback($mainData)) {
+        $transfer = fetch_json_with_reauth(
+            $settings,
+            $instance,
+            $verifyCert,
+            $instance['url'] . '/api/v2/transfer/info',
+            'transfer/info',
+            'transfer',
+            $headers,
+            $sidCookie,
+            $debugInfo
+        );
+    }
+
+    return build_instance_snapshot($state, $sidCookie, $mainData, $transfer);
+}
+
+function fetch_parallel_login_responses(
+    array $config,
+    array $requests,
+    string $reason
+): array
+{
+    if (empty($requests)) {
+        return [];
+    }
+
+    $settings = get_monitor_settings($config);
+    $limit = min(max(1, $settings['parallel_sync_limit']), count($requests));
+    $queue = array_values($requests);
+    $index = 0;
+    $multi = curl_multi_init();
+    $contexts = [];
+    $results = [];
+    $running = 0;
+
+    while (($index < count($queue)) || !empty($contexts) || ($running > 0)) {
+        while (($index < count($queue)) && (count($contexts) < $limit)) {
+            $request = $queue[$index++];
+            $instance = $request['instance'];
+            $headers = create_instance_headers($instance);
+            $verifyCert = $instance['verify_cert'] ?? false;
+            $debugInfo = $request['debug'];
+            $debugInfo['login_performed'] = true;
+            $debugInfo['auth_attempts']++;
+            $debugInfo['auth_reasons'][] = $reason;
+            if ($reason !== 'initial') {
+                $debugInfo['reauth_performed'] = true;
+            }
+            $headerState = (object)[
+                'sid_cookie' => null,
+                'response_sid_seen' => false,
+            ];
+
+            $ch = create_basic_instance_curl_handle($instance, $settings, $verifyCert, $headers['login']);
+            curl_setopt($ch, CURLOPT_URL, $instance['url'] . '/api/v2/auth/login');
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+                'username' => $instance['username'],
+                'password' => $instance['password'],
+            ]));
+            curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($curl, $header) use ($headerState) {
+                $trimmed = ltrim($header);
+
+                if (stripos($trimmed, 'Set-Cookie:') === 0 && stripos($trimmed, 'SID') !== false) {
+                    $cookieString = trim(substr($trimmed, strlen('Set-Cookie:')));
+                    $parts = explode(';', $cookieString);
+                    $sidPart = trim($parts[0]);
+
+                    if (stripos($sidPart, 'SID') !== false) {
+                        $headerState->sid_cookie = $sidPart;
+                        $headerState->response_sid_seen = true;
+                    }
+                }
+
+                return strlen($header);
+            });
+
+            $code = curl_multi_add_handle($multi, $ch);
+            if ($code !== CURLM_OK) {
+                curl_close($ch);
+                throw new RuntimeException(sprintf(
+                    'Unable to queue auth request for %s: %s',
+                    $instance['name'],
+                    curl_multi_strerror($code)
+                ));
+            }
+
+            $contexts[(int)$ch] = [
+                'handle' => $ch,
+                'instance' => $instance,
+                'debug' => $debugInfo,
+                'header_state' => $headerState,
+                'started_at' => microtime(true),
+            ];
+        }
+
+        do {
+            $status = curl_multi_exec($multi, $running);
+        } while ($status === CURLM_CALL_MULTI_PERFORM);
+
+        if (($status !== CURLM_OK) && ($status !== CURLM_CALL_MULTI_PERFORM)) {
+            throw new RuntimeException('curl_multi_exec failed during auth: ' . curl_multi_strerror($status));
+        }
+
+        while ($info = curl_multi_info_read($multi)) {
+            $ch = $info['handle'];
+            $key = (int)$ch;
+            $context = $contexts[$key] ?? null;
+            if ($context === null) {
+                curl_multi_remove_handle($multi, $ch);
+                curl_close($ch);
+                continue;
+            }
+
+            $httpCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            $elapsedMs = round((microtime(true) - $context['started_at']) * 1000, 1);
+            $debugInfo = $context['debug'];
+            $debugInfo['auth_ms'] = $elapsedMs;
+            $debugInfo['auth_http_codes'][] = $httpCode;
+            $headerState = $context['header_state'];
+            $sidCookie = $headerState->sid_cookie;
+            $error = null;
+
+            if ($info['result'] !== CURLE_OK) {
+                $curlError = curl_error($ch);
+                $error = sprintf(
+                    'Auth request failed for %s: %s',
+                    $context['instance']['name'],
+                    $curlError !== '' ? $curlError : curl_strerror($info['result'])
+                );
+            } elseif ($httpCode >= 400) {
+                $error = sprintf(
+                    'Auth failed for %s (HTTP %d)',
+                    $context['instance']['name'],
+                    $httpCode
+                );
+            } else {
+                if ($sidCookie === null) {
+                    $cookies = curl_getinfo($ch, CURLINFO_COOKIELIST) ?: [];
+
+                    foreach ($cookies as $cookie) {
+                        $parts = explode("\t", $cookie);
+                        if (count($parts) < 7) {
+                            continue;
+                        }
+
+                        $name = trim($parts[count($parts) - 2]);
+                        $value = trim($parts[count($parts) - 1]);
+                        if (stripos($name, 'SID') !== false && $value !== '') {
+                            $sidCookie = $name . '=' . $value;
+                            break;
+                        }
+                    }
+                }
+
+                if ($sidCookie === null) {
+                    $error = sprintf(
+                        'Auth for %s did not return a SID cookie',
+                        $context['instance']['name']
+                    );
+                }
+            }
+
+            if ($headerState->response_sid_seen) {
+                $debugInfo['response_sid_seen'] = true;
+            }
+            $debugInfo['session_cookie_name'] = extract_sid_cookie_name($sidCookie);
+
+            $results[$context['instance']['name']] = [
+                'sid_cookie' => $sidCookie,
+                'debug' => $debugInfo,
+                'error' => $error,
+            ];
+
+            curl_multi_remove_handle($multi, $ch);
+            curl_close($ch);
+            unset($contexts[$key]);
+        }
+
+        if ($running > 0) {
+            $selectResult = curl_multi_select($multi, 1.0);
+            if ($selectResult === -1) {
+                usleep(10000);
+            }
+        }
+    }
+
+    curl_multi_close($multi);
+
+    return $results;
+}
+
+function fetch_parallel_sync_responses(
+    array $config,
+    array $requests,
+    bool $retry = false
+): array
 {
     if (empty($requests)) {
         return [];
@@ -319,7 +618,7 @@ function fetch_parallel_sync_responses(array $config, array $requests): array
 
             $ch = create_basic_instance_curl_handle($instance, $settings, $verifyCert, $headers['default']);
             curl_setopt($ch, CURLOPT_URL, $instance['url'] . '/api/v2/sync/maindata?rid=' . urlencode((string)$state['last_rid']));
-            curl_setopt($ch, CURLOPT_COOKIE, $state['stored_sid']);
+            curl_setopt($ch, CURLOPT_COOKIE, $request['sid_cookie'] ?? $state['stored_sid']);
 
             $code = curl_multi_add_handle($multi, $ch);
             if ($code !== CURLM_OK) {
@@ -360,22 +659,44 @@ function fetch_parallel_sync_responses(array $config, array $requests): array
 
             $body = curl_multi_getcontent($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-            $error = ($info['result'] === CURLE_OK) ? null : curl_error($ch);
+            $error = null;
+            if ($info['result'] !== CURLE_OK) {
+                $curlError = curl_error($ch);
+                $error = sprintf(
+                    'sync/maindata request failed for %s: %s',
+                    $context['instance']['name'],
+                    $curlError !== '' ? $curlError : curl_strerror($info['result'])
+                );
+            }
             $elapsedMs = round((microtime(true) - $context['started_at']) * 1000, 1);
             $debugInfo = $context['debug'];
-            $debugInfo['sync_http_code'] = $httpCode;
+            $debugInfo[$retry ? 'sync_retry_http_code' : 'sync_http_code'] = $httpCode;
             $debugInfo['sync_ms'] = $elapsedMs;
             $debugInfo['sync_bytes'] = ($body === false) ? 0 : strlen($body);
+            $mainData = null;
+
+            if ($error === null && $httpCode < 400) {
+                try {
+                    $mainData = decode_json_response(
+                        ($body === false) ? null : $body,
+                        'sync/maindata',
+                        $context['instance']['name']
+                    );
+                } catch (Throwable $e) {
+                    $error = truncate_error_message($e->getMessage());
+                }
+            }
 
             $results[$context['instance']['name']] = [
                 'instance' => $context['instance'],
                 'state' => $context['state'],
                 'debug' => $debugInfo,
                 'http_code' => $httpCode,
-                'body' => ($body === false) ? null : $body,
+                'main_data' => $mainData,
                 'error' => $error,
             ];
 
+            unset($body);
             curl_multi_remove_handle($multi, $ch);
             curl_close($ch);
             unset($contexts[$key]);

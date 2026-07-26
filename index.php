@@ -1,6 +1,6 @@
 <?php
 
-const QBIT_STATS_VERSION = '0.6.3';
+const QBIT_STATS_VERSION = '0.6.4';
 const QBIT_STATS_LATEST_RELEASE_API_URL = 'https://api.github.com/repos/Aleksman4o/qbit_stats/releases/latest';
 
 $config = require __DIR__ . '/config.php';
@@ -1194,6 +1194,10 @@ $defaultHistoryHours = $historyData['hours'];
                     ...(categoryChartInstance.options.scales.y.ticks || {}),
                     color: chartText,
                 };
+                categoryChartInstance.options.plugins.categoryBarValueLabels = {
+                    ...(categoryChartInstance.options.plugins.categoryBarValueLabels || {}),
+                    color: chartText,
+                };
                 categoryChartInstance.options.plugins.tooltip = {
                     ...(categoryChartInstance.options.plugins.tooltip || {}),
                     backgroundColor: tooltipBackground,
@@ -1877,6 +1881,39 @@ $defaultHistoryHours = $historyData['hours'];
             renderCategoryHistoryLegend();
         }
 
+        const categoryBarValueLabelsPlugin = {
+            id: 'categoryBarValueLabels',
+            afterDatasetsDraw(chart, args, options) {
+                if (!chart.isDatasetVisible(0)) {
+                    return;
+                }
+
+                const dataset = chart.data.datasets[0];
+                const bars = chart.getDatasetMeta(0).data;
+                const color = options.color || getChartThemeColors().chartText;
+                const padding = Number(options.padding) || 8;
+
+                chart.ctx.save();
+                chart.ctx.fillStyle = color;
+                chart.ctx.font = '600 12px "IBM Plex Sans", "Segoe UI", sans-serif';
+                chart.ctx.textAlign = 'left';
+                chart.ctx.textBaseline = 'middle';
+
+                bars.forEach((bar, index) => {
+                    const label = formatSpeed(dataset.data[index]);
+                    const labelWidth = chart.ctx.measureText(label).width;
+                    const labelX = Math.min(
+                        bar.x + padding,
+                        chart.width - labelWidth - 4
+                    );
+
+                    chart.ctx.fillText(label, labelX, bar.y);
+                });
+
+                chart.ctx.restore();
+            },
+        };
+
         function renderCategoryChart(categories, options = {}) {
             const animate = options.animate === true;
             const context = document.getElementById('categoryChart').getContext('2d');
@@ -1908,12 +1945,15 @@ $defaultHistoryHours = $historyData['hours'];
                         indexAxis: 'y',
                         maintainAspectRatio: false,
                         responsive: true,
+                        layout: {
+                            padding: {
+                                right: 100,
+                            },
+                        },
                         scales: {
                             x: {
+                                display: false,
                                 beginAtZero: true,
-                                ticks: {
-                                    callback: value => formatSpeed(value),
-                                },
                             },
                             y: {
                                 grid: {
@@ -1924,6 +1964,10 @@ $defaultHistoryHours = $historyData['hours'];
                         plugins: {
                             legend: {
                                 display: false,
+                            },
+                            categoryBarValueLabels: {
+                                color: getChartThemeColors().chartText,
+                                padding: 8,
                             },
                             tooltip: {
                                 ...getTooltipAnimationOptions(),
@@ -1938,6 +1982,7 @@ $defaultHistoryHours = $historyData['hours'];
                             },
                         },
                     },
+                    plugins: [categoryBarValueLabelsPlugin],
                 });
             } else {
                 categoryChartInstance.data = chartData;

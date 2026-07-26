@@ -10,7 +10,7 @@ function get_monitor_settings(array $config): array
         'history_retention_days' => 7,
         'connect_timeout_seconds' => 5,
         'request_timeout_seconds' => 20,
-        'parallel_sync_limit' => 7,
+        'parallel_sync_limit' => 20,
         'debug_sync' => false,
         'lock_path' => __DIR__ . '/qbittorrent_stats.lock',
     ];

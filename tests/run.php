@@ -86,6 +86,7 @@ INI);
         array_column($parsedClientsConfig['instances'], 'name'),
         'Only qBittorrent clients up to and including [other] qt must be configured'
     );
+    assert_same(20, get_monitor_settings([])['parallel_sync_limit'], 'The default parallel request limit must support larger installations');
 
     $db = open_database($config);
     assert_same(30, get_history_bucket_seconds(1), 'One-hour history must keep 30-second points');
