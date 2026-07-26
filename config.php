@@ -1,8 +1,22 @@
 <?php
 function parseClientsConfig() {
-    $iniFile = __DIR__ . '/../../data/config.ini';
-    if (!file_exists($iniFile)) {
-        throw new Exception("Config file config.ini not found at: " . realpath($iniFile));
+    $iniCandidates = [
+        __DIR__ . '/../data/config.ini',
+        __DIR__ . '/../../data/config.ini',
+    ];
+    $iniFile = null;
+
+    foreach ($iniCandidates as $candidate) {
+        if (is_file($candidate)) {
+            $iniFile = $candidate;
+            break;
+        }
+    }
+
+    if ($iniFile === null) {
+        throw new Exception(
+            "Config file config.ini not found. Checked: " . implode(', ', $iniCandidates)
+        );
     }
 
     $iniContent = parse_ini_file($iniFile, true, INI_SCANNER_TYPED);
