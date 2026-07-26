@@ -119,7 +119,7 @@ $defaultHistoryHours = $historyData['hours'];
             --overlay-panel: rgba(255, 255, 255, 0.95);
             --chart-grid: rgba(134, 151, 136, 0.22);
             --chart-text: #607062;
-            --chart-tooltip-bg: rgba(23, 32, 24, 0.94);
+            --chart-tooltip-bg: rgba(23, 32, 24, 0.84);
             --chart-tooltip-text: #f6faf5;
             --chart-tooltip-border: rgba(110, 132, 112, 0.26);
             --shadow: 0 18px 40px rgba(34, 54, 35, 0.08);
@@ -157,7 +157,7 @@ $defaultHistoryHours = $historyData['hours'];
             --overlay-panel: rgba(14, 19, 16, 0.97);
             --chart-grid: rgba(104, 123, 110, 0.18);
             --chart-text: #adbcaf;
-            --chart-tooltip-bg: rgba(12, 17, 14, 0.98);
+            --chart-tooltip-bg: rgba(12, 17, 14, 0.84);
             --chart-tooltip-text: #edf3eb;
             --chart-tooltip-border: rgba(87, 107, 93, 0.34);
             --shadow: 0 24px 56px rgba(0, 0, 0, 0.42);
@@ -487,6 +487,13 @@ $defaultHistoryHours = $historyData['hours'];
             height: 420px;
         }
 
+        @media (min-width: 1241px) {
+            .chart-wrap,
+            .chart-wrap.compact {
+                height: clamp(180px, calc((100vh - 360px) / 2), 420px);
+            }
+        }
+
         .table-shell {
             overflow-x: auto;
         }
@@ -742,6 +749,13 @@ $defaultHistoryHours = $historyData['hours'];
                             <h2>Таймлайн скоростей по инстансам</h2>
                             <p class="panel-copy">Наведи курсор, чтобы моментально подменить таблицу категорий. Клик фиксирует момент до ручного сброса.</p>
                         </div>
+                        <button
+                            id="instanceHistoryLegendToggle"
+                            type="button"
+                            class="panel-action"
+                            aria-controls="historyChart"
+                            aria-expanded="true"
+                        >Скрыть легенду</button>
                     </div>
                     <div class="chart-wrap">
                         <canvas id="historyChart"></canvas>
@@ -894,6 +908,7 @@ $defaultHistoryHours = $historyData['hours'];
         const categoryCache = new Map();
         const categoryTooltipMarkerCache = new Map();
         const themeStorageKey = 'qbitStatsTheme';
+        const instanceHistoryLegendStorageKey = 'qbitStatsInstanceHistoryLegendVisible';
         const categoryHistoryLegendStorageKey = 'qbitStatsCategoryHistoryLegendVisible';
         if (currentData.last_update) {
             categoryCache.set(currentData.last_update, currentData.categories);
@@ -1207,6 +1222,23 @@ $defaultHistoryHours = $historyData['hours'];
             };
         }
 
+        function getTooltipAnimationOptions() {
+            return {
+                animation: {
+                    duration: 0,
+                },
+                animations: {
+                    numbers: {
+                        duration: 0,
+                    },
+                    opacity: {
+                        duration: 60,
+                        easing: 'linear',
+                    },
+                },
+            };
+        }
+
         function computeCategoryTotals(categories) {
             return categories.reduce((totals, category) => {
                 totals.count += 1;
@@ -1397,6 +1429,7 @@ $defaultHistoryHours = $historyData['hours'];
                         },
                         plugins: {
                             legend: {
+                                display: loadInstanceHistoryLegendVisible(),
                                 position: 'top',
                                 labels: {
                                     boxWidth: 10,
@@ -1407,6 +1440,7 @@ $defaultHistoryHours = $historyData['hours'];
                             tooltip: {
                                 mode: 'index',
                                 intersect: false,
+                                ...getTooltipAnimationOptions(),
                                 usePointStyle: true,
                                 boxWidth: 9,
                                 boxHeight: 14,
@@ -1611,6 +1645,41 @@ $defaultHistoryHours = $historyData['hours'];
             }
         }
 
+        function loadInstanceHistoryLegendVisible() {
+            try {
+                return localStorage.getItem(instanceHistoryLegendStorageKey) !== 'false';
+            } catch (error) {
+                return true;
+            }
+        }
+
+        function saveInstanceHistoryLegendVisible(visible) {
+            try {
+                localStorage.setItem(instanceHistoryLegendStorageKey, String(visible));
+            } catch (error) {
+            }
+        }
+
+        function setInstanceHistoryLegendVisible(visible) {
+            const button = document.getElementById('instanceHistoryLegendToggle');
+            if (button) {
+                button.textContent = visible ? 'Скрыть легенду' : 'Показать легенду';
+                button.setAttribute('aria-expanded', visible ? 'true' : 'false');
+            }
+
+            if (!historyChartInstance) {
+                return;
+            }
+
+            const legend = historyChartInstance.options.plugins.legend;
+            if (legend.display === visible) {
+                return;
+            }
+
+            legend.display = visible;
+            historyChartInstance.update('none');
+        }
+
         function renderCategoryUploadHistoryChart() {
             const model = buildCategoryUploadHistoryModel(historyPayload.category_upload_history || {});
             const context = document.getElementById('categoryHistoryChart').getContext('2d');
@@ -1666,6 +1735,7 @@ $defaultHistoryHours = $historyData['hours'];
                             tooltip: {
                                 mode: 'index',
                                 intersect: false,
+                                ...getTooltipAnimationOptions(),
                                 usePointStyle: true,
                                 boxWidth: 9,
                                 boxHeight: 14,
@@ -1760,6 +1830,7 @@ $defaultHistoryHours = $historyData['hours'];
                                 display: false,
                             },
                             tooltip: {
+                                ...getTooltipAnimationOptions(),
                                 usePointStyle: true,
                                 boxWidth: 9,
                                 boxHeight: 14,
@@ -2226,8 +2297,10 @@ $defaultHistoryHours = $historyData['hours'];
             const historyHoursSelect = document.getElementById('historyHoursSelect');
             const clearSelectionButton = document.getElementById('clearSelectionButton');
             const themeToggleButton = document.getElementById('themeToggleButton');
+            const instanceHistoryLegendToggle = document.getElementById('instanceHistoryLegendToggle');
             const categoryHistoryLegendToggle = document.getElementById('categoryHistoryLegendToggle');
 
+            setInstanceHistoryLegendVisible(loadInstanceHistoryLegendVisible());
             setCategoryHistoryLegendVisible(loadCategoryHistoryLegendVisible());
 
             const storedAutoRefresh = localStorage.getItem('qbitStatsAutoRefresh');
@@ -2241,6 +2314,13 @@ $defaultHistoryHours = $historyData['hours'];
 
             themeToggleButton.addEventListener('click', () => {
                 applyTheme(getCurrentTheme() === 'dark' ? 'light' : 'dark');
+            });
+
+            instanceHistoryLegendToggle.addEventListener('click', () => {
+                const currentVisible = historyChartInstance.options.plugins.legend.display !== false;
+                const nextVisible = !currentVisible;
+                setInstanceHistoryLegendVisible(nextVisible);
+                saveInstanceHistoryLegendVisible(nextVisible);
             });
 
             categoryHistoryLegendToggle.addEventListener('click', () => {
