@@ -5,7 +5,7 @@ require_once __DIR__ . '/bootstrap.php';
 function maybe_refresh_stats(array $config, bool $force = false): array
 {
     $db = open_database($config);
-    $latestBefore = get_latest_update($db);
+    $latestBefore = get_latest_update($db, $config);
     $refreshNeeded = $force || is_refresh_needed($db, $config);
     $db->close();
 
@@ -54,7 +54,7 @@ function maybe_refresh_stats(array $config, bool $force = false): array
                 'needed' => false,
                 'performed' => false,
                 'in_progress' => false,
-                'latest_update' => get_latest_update($db),
+                'latest_update' => get_latest_update($db, $config),
             ];
         }
 
@@ -65,7 +65,7 @@ function maybe_refresh_stats(array $config, bool $force = false): array
             'needed' => true,
             'performed' => true,
             'in_progress' => false,
-            'latest_update' => get_latest_update($db),
+            'latest_update' => get_latest_update($db, $config),
             'summary' => $summary,
         ];
     } catch (Throwable $e) {
@@ -1302,10 +1302,6 @@ function persist_instance_error(SQLite3 $db, array $instance, string $snapshotTi
 
     try {
         ensure_instance_row($db, $instance['name']);
-
-        $deleteCategories = $db->prepare('DELETE FROM categories WHERE instance_name = :instance_name');
-        $deleteCategories->bindValue(':instance_name', $instance['name'], SQLITE3_TEXT);
-        $deleteCategories->execute();
 
         $updateInstance = $db->prepare('UPDATE instances
             SET dl_speed = 0,

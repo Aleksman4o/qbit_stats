@@ -10,7 +10,7 @@ $initialRefreshMeta = [
     'needed' => is_refresh_needed($db, $config),
     'performed' => false,
     'in_progress' => false,
-    'latest_update' => get_latest_update($db),
+    'latest_update' => get_latest_update($db, $config),
 ];
 $currentData = get_current_data($db, $config, $initialRefreshMeta);
 $historyData = get_history_data($db, $config, $currentData['meta']['history_hours_default']);
@@ -1080,38 +1080,54 @@ $defaultHistoryHours = $historyData['hours'];
         function buildHistoryModel(items) {
             const timestamps = [...new Set(items.map(item => item.timestamp))].sort();
             const labels = timestamps.map(formatTimeLabel);
+            const pointsByInstance = new Map(instanceNames.map(instanceName => [instanceName, new Map()]));
 
-            const downloadDatasets = instanceNames.map(instanceName => ({
-                label: `${instanceName} ↓ Download`,
-                data: timestamps.map(timestamp => {
-                    const row = items.find(item => item.instance_name === instanceName && item.timestamp === timestamp);
-                    return row ? Number(row.dl_speed) || 0 : 0;
-                }),
-                backgroundColor: makeColor(`${instanceName}-dl`, 0.16),
-                borderColor: makeColor(`${instanceName}-dl`, 0.78),
-                borderWidth: 1.4,
-                fill: true,
-                tension: 0.24,
-                stack: 'download',
-                pointRadius: 0,
-                pointHoverRadius: 4,
-            }));
+            for (const item of items) {
+                const instancePoints = pointsByInstance.get(item.instance_name);
+                if (instancePoints && !instancePoints.has(item.timestamp)) {
+                    instancePoints.set(item.timestamp, item);
+                }
+            }
 
-            const uploadDatasets = instanceNames.map(instanceName => ({
-                label: `${instanceName} ↑ Upload`,
-                data: timestamps.map(timestamp => {
-                    const row = items.find(item => item.instance_name === instanceName && item.timestamp === timestamp);
-                    return row ? Number(row.up_speed) || 0 : 0;
-                }),
-                backgroundColor: makeColor(`${instanceName}-up`, 0.08),
-                borderColor: makeColor(`${instanceName}-up`, 0.48),
-                borderWidth: 1.1,
-                fill: true,
-                tension: 0.24,
-                stack: 'upload',
-                pointRadius: 0,
-                pointHoverRadius: 4,
-            }));
+            const downloadDatasets = instanceNames.map(instanceName => {
+                const instancePoints = pointsByInstance.get(instanceName);
+
+                return {
+                    label: `${instanceName} ↓ Download`,
+                    data: timestamps.map(timestamp => {
+                        const row = instancePoints.get(timestamp);
+                        return row ? Number(row.dl_speed) || 0 : 0;
+                    }),
+                    backgroundColor: makeColor(`${instanceName}-dl`, 0.16),
+                    borderColor: makeColor(`${instanceName}-dl`, 0.78),
+                    borderWidth: 1.4,
+                    fill: true,
+                    tension: 0.24,
+                    stack: 'download',
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                };
+            });
+
+            const uploadDatasets = instanceNames.map(instanceName => {
+                const instancePoints = pointsByInstance.get(instanceName);
+
+                return {
+                    label: `${instanceName} ↑ Upload`,
+                    data: timestamps.map(timestamp => {
+                        const row = instancePoints.get(timestamp);
+                        return row ? Number(row.up_speed) || 0 : 0;
+                    }),
+                    backgroundColor: makeColor(`${instanceName}-up`, 0.08),
+                    borderColor: makeColor(`${instanceName}-up`, 0.48),
+                    borderWidth: 1.1,
+                    fill: true,
+                    tension: 0.24,
+                    stack: 'upload',
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                };
+            });
 
             return {
                 timestamps,
@@ -1488,7 +1504,7 @@ $defaultHistoryHours = $historyData['hours'];
                 const payload = await response.json();
 
                 if (!response.ok && !payload.last_update) {
-                    throw new Error(payload.meta?.refresh?.error || 'Не удалось получить текущие данные');
+                    throw new Error(payload.error || payload.meta?.refresh?.error || 'Не удалось получить текущие данные');
                 }
 
                 currentData = payload;

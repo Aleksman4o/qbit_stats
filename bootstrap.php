@@ -134,6 +134,11 @@ function ensure_schema(SQLite3 $db): void
         last_login DATETIME
     )');
 
+    $db->exec('CREATE TABLE IF NOT EXISTS schema_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at DATETIME NOT NULL
+    )');
+
     ensure_table_columns($db, 'instances', [
         'torrent_count' => 'INTEGER DEFAULT 0',
         'status' => 'TEXT DEFAULT "unknown"',
@@ -161,7 +166,63 @@ function ensure_schema(SQLite3 $db): void
     $db->exec('UPDATE instances SET last_success = last_update WHERE last_success IS NULL AND last_update IS NOT NULL');
     $db->exec('UPDATE instances SET last_attempt = last_update WHERE last_attempt IS NULL AND last_update IS NOT NULL');
 
+    run_schema_migrations($db);
     ensure_indexes($db);
+}
+
+function run_schema_migrations(SQLite3 $db): void
+{
+    $migrationName = '20260726_rebuild_categories_after_instance_errors';
+    $migrationCheck = $db->prepare('SELECT 1 FROM schema_migrations WHERE name = :name');
+    $migrationCheck->bindValue(':name', $migrationName, SQLITE3_TEXT);
+
+    if ($migrationCheck->execute()->fetchArray(SQLITE3_NUM)) {
+        return;
+    }
+
+    $db->exec('BEGIN IMMEDIATE');
+
+    try {
+        $migrationCheck = $db->prepare('SELECT 1 FROM schema_migrations WHERE name = :name');
+        $migrationCheck->bindValue(':name', $migrationName, SQLITE3_TEXT);
+
+        if (!$migrationCheck->execute()->fetchArray(SQLITE3_NUM)) {
+            rebuild_all_categories_from_torrents($db);
+
+            $insertMigration = $db->prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (:name, :applied_at)');
+            $insertMigration->bindValue(':name', $migrationName, SQLITE3_TEXT);
+            $insertMigration->bindValue(':applied_at', date('Y-m-d H:i:s'), SQLITE3_TEXT);
+            $insertMigration->execute();
+        }
+
+        $db->exec('COMMIT');
+    } catch (Throwable $e) {
+        $db->exec('ROLLBACK');
+        throw $e;
+    }
+}
+
+function rebuild_all_categories_from_torrents(SQLite3 $db): void
+{
+    $db->exec('DELETE FROM categories');
+    $db->exec("INSERT INTO categories
+        (instance_name, category, active_torrents, dl_speed, up_speed, total_size, uploaded_session, uploaded_total, last_update)
+        SELECT
+            torrents.instance_name,
+            CASE
+                WHEN torrents.category IS NULL OR torrents.category = '' THEN 'Uncategorized'
+                ELSE torrents.category
+            END AS normalized_category,
+            SUM(CASE WHEN torrents.state IN ('uploading', 'downloading') THEN 1 ELSE 0 END),
+            SUM(torrents.dlspeed),
+            SUM(torrents.upspeed),
+            SUM(torrents.size),
+            SUM(torrents.uploaded_session),
+            SUM(torrents.uploaded_total),
+            MAX(instances.last_update)
+        FROM torrents
+        LEFT JOIN instances ON instances.name = torrents.instance_name
+        GROUP BY torrents.instance_name, normalized_category");
 }
 
 function ensure_table_columns(SQLite3 $db, string $table, array $columns): void
@@ -204,16 +265,60 @@ function ensure_indexes(SQLite3 $db): void
     $db->exec('DROP INDEX IF EXISTS idx_torrents_instance');
 }
 
-function get_latest_update(SQLite3 $db): ?string
+function get_configured_instance_names(array $config): array
 {
-    $value = $db->querySingle('SELECT MAX(last_update) FROM instances WHERE last_update IS NOT NULL');
+    $names = [];
+
+    foreach ($config['instances'] ?? [] as $instance) {
+        $name = (string)($instance['name'] ?? '');
+        if ($name !== '') {
+            $names[$name] = true;
+        }
+    }
+
+    return array_keys($names);
+}
+
+function create_sqlite_placeholders(array $values, string $prefix): array
+{
+    $placeholders = [];
+
+    foreach (array_keys($values) as $index) {
+        $placeholders[] = ':' . $prefix . $index;
+    }
+
+    return $placeholders;
+}
+
+function bind_sqlite_text_values(SQLite3Stmt $stmt, array $values, string $prefix): void
+{
+    foreach (array_values($values) as $index => $value) {
+        $stmt->bindValue(':' . $prefix . $index, (string)$value, SQLITE3_TEXT);
+    }
+}
+
+function get_latest_update(SQLite3 $db, array $config): ?string
+{
+    $instanceNames = get_configured_instance_names($config);
+    if (empty($instanceNames)) {
+        return null;
+    }
+
+    $placeholders = create_sqlite_placeholders($instanceNames, 'latest_instance_');
+    $stmt = $db->prepare('SELECT MAX(last_update) AS latest_update
+        FROM instances
+        WHERE last_update IS NOT NULL
+          AND name IN (' . implode(', ', $placeholders) . ')');
+    bind_sqlite_text_values($stmt, $instanceNames, 'latest_instance_');
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    $value = $row['latest_update'] ?? null;
 
     return $value !== null && $value !== '' ? $value : null;
 }
 
 function is_refresh_needed(SQLite3 $db, array $config): bool
 {
-    $latestUpdate = get_latest_update($db);
+    $latestUpdate = get_latest_update($db, $config);
     if ($latestUpdate === null) {
         return true;
     }
@@ -262,4 +367,25 @@ function truncate_error_message(string $message, int $limit = 240): string
     }
 
     return substr($message, 0, $limit - 3) . '...';
+}
+
+function send_json_response($payload, int $statusCode = 200): void
+{
+    http_response_code($statusCode);
+    header('Content-Type: application/json; charset=utf-8');
+
+    $json = json_encode(
+        $payload,
+        JSON_UNESCAPED_UNICODE
+        | JSON_UNESCAPED_SLASHES
+        | JSON_INVALID_UTF8_SUBSTITUTE
+    );
+
+    if ($json === false) {
+        http_response_code(500);
+        echo '{"error":"Failed to encode JSON response"}';
+        return;
+    }
+
+    echo $json;
 }

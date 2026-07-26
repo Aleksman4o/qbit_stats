@@ -1,6 +1,6 @@
 <?php
 function parseClientsConfig() {
-    $iniFile = __DIR__ . '/../data/config.ini';
+    $iniFile = __DIR__ . '/../../data/config.ini';
     if (!file_exists($iniFile)) {
         throw new Exception("Config file config.ini not found at: " . realpath($iniFile));
     }

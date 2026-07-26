@@ -1,11 +1,13 @@
 <?php
 
-header('Content-Type: application/json');
-
-$config = require __DIR__ . '/config.php';
+require_once __DIR__ . '/bootstrap.php';
 require_once __DIR__ . '/data_functions.php';
 
+$db = null;
+
 try {
+    $config = require __DIR__ . '/config.php';
+
     if (!isset($_GET['timestamp'])) {
         throw new InvalidArgumentException('Timestamp parameter is missing');
     }
@@ -16,14 +18,22 @@ try {
     }
 
     $db = open_database($config);
-    $data = get_category_history($db, $timestamp);
+    $data = get_category_history($db, $config, $timestamp);
     $db->close();
+    $db = null;
 
-    echo json_encode([
+    send_json_response([
         'timestamp' => $timestamp,
         'data' => $data,
-    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    ]);
 } catch (InvalidArgumentException $e) {
-    http_response_code(400);
-    echo json_encode(['error' => $e->getMessage()]);
+    send_json_response(['error' => $e->getMessage()], 400);
+} catch (Throwable $e) {
+    if ($db instanceof SQLite3) {
+        $db->close();
+    }
+
+    send_json_response([
+        'error' => truncate_error_message($e->getMessage()),
+    ], 500);
 }
