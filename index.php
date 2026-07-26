@@ -389,6 +389,55 @@ $defaultHistoryHours = $historyData['hours'];
             margin-bottom: 18px;
         }
 
+        .full-width-panel {
+            margin-bottom: 18px;
+        }
+
+        .category-history-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 7px 10px;
+            max-height: 108px;
+            margin-bottom: 10px;
+            padding: 4px 2px 8px;
+            overflow-y: auto;
+        }
+
+        .category-history-legend[hidden] {
+            display: none;
+        }
+
+        .category-history-legend button {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 6px;
+            border: 0;
+            border-radius: 8px;
+            background: transparent;
+            color: var(--muted);
+            font: inherit;
+            font-size: 0.75rem;
+            cursor: pointer;
+        }
+
+        .category-history-legend button:hover {
+            color: var(--text);
+            background: var(--row-hover);
+        }
+
+        .category-history-legend button.is-hidden {
+            opacity: 0.38;
+        }
+
+        .category-history-legend .series-swatch {
+            width: 10px;
+            height: 10px;
+            flex: 0 0 10px;
+            border: 2px solid var(--series-color);
+            border-radius: 50%;
+        }
+
         .panel-head {
             display: flex;
             justify-content: space-between;
@@ -410,6 +459,24 @@ $defaultHistoryHours = $historyData['hours'];
             margin: 6px 0 0;
             color: var(--muted);
             font-size: 0.92rem;
+        }
+
+        .panel-action {
+            flex: 0 0 auto;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--panel-strong);
+            color: var(--muted);
+            font: inherit;
+            font-size: 0.82rem;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .panel-action:hover {
+            color: var(--text);
+            border-color: var(--accent-border);
         }
 
         .chart-wrap {
@@ -697,6 +764,28 @@ $defaultHistoryHours = $historyData['hours'];
             </article>
         </section>
 
+        <section class="panel full-width-panel">
+            <div class="panel-body">
+                <div class="panel-head">
+                    <div>
+                        <h2>История скорости отдачи по категориям</h2>
+                        <p class="panel-copy">Все категории за выбранный период. Двигайте курсор по вертикали, чтобы листать окно скоростей; клик фиксирует исторический срез.</p>
+                    </div>
+                    <button
+                        id="categoryHistoryLegendToggle"
+                        type="button"
+                        class="panel-action"
+                        aria-controls="categoryHistoryLegend"
+                        aria-expanded="true"
+                    >Скрыть легенду</button>
+                </div>
+                <div id="categoryHistoryLegend" class="category-history-legend" aria-label="Категории графика"></div>
+                <div class="chart-wrap">
+                    <canvas id="categoryHistoryChart"></canvas>
+                </div>
+            </div>
+        </section>
+
         <section class="panel" style="margin-bottom: 18px;">
             <div class="panel-body">
                 <div class="panel-head">
@@ -791,6 +880,7 @@ $defaultHistoryHours = $historyData['hours'];
         let historyPayload = historyPayloadSeed;
         let selectedHistoryHours = historyPayload.hours || currentData.meta.history_hours_default;
         let historyChartInstance = null;
+        let categoryHistoryChartInstance = null;
         let categoryChartInstance = null;
         let autoRefreshTimer = null;
         let followupRefreshTimer = null;
@@ -932,6 +1022,34 @@ $defaultHistoryHours = $historyData['hours'];
                 historyChartInstance.update('none');
             }
 
+            if (categoryHistoryChartInstance) {
+                categoryHistoryChartInstance.options.scales.x.ticks = {
+                    ...(categoryHistoryChartInstance.options.scales.x.ticks || {}),
+                    color: chartText,
+                };
+                categoryHistoryChartInstance.options.scales.y.ticks = {
+                    ...(categoryHistoryChartInstance.options.scales.y.ticks || {}),
+                    color: chartText,
+                };
+                categoryHistoryChartInstance.options.scales.y.grid = {
+                    ...(categoryHistoryChartInstance.options.scales.y.grid || {}),
+                    color: chartGrid,
+                };
+                categoryHistoryChartInstance.options.plugins.legend.labels = {
+                    ...(categoryHistoryChartInstance.options.plugins.legend.labels || {}),
+                    color: chartText,
+                };
+                categoryHistoryChartInstance.options.plugins.tooltip = {
+                    ...(categoryHistoryChartInstance.options.plugins.tooltip || {}),
+                    backgroundColor: tooltipBackground,
+                    titleColor: tooltipText,
+                    bodyColor: tooltipText,
+                    borderColor: tooltipBorder,
+                    borderWidth: 1,
+                };
+                categoryHistoryChartInstance.update('none');
+            }
+
             if (categoryChartInstance) {
                 categoryChartInstance.options.scales.x.ticks = {
                     ...(categoryChartInstance.options.scales.x.ticks || {}),
@@ -998,6 +1116,16 @@ $defaultHistoryHours = $historyData['hours'];
             const lightness = theme === 'dark' ? 60 : 46;
 
             return `hsla(${hue}, ${saturation}%, ${lightness}%, ${alpha})`;
+        }
+
+        function makeDistinctSeriesColor(index, alpha, hueOffset = 210) {
+            const hue = (hueOffset + (Math.max(0, index) * 137.508)) % 360;
+            return `hsla(${hue.toFixed(1)}, 82%, 52%, ${alpha})`;
+        }
+
+        function makeInstanceColor(instanceName, alpha) {
+            const index = instanceNames.indexOf(instanceName);
+            return makeDistinctSeriesColor(index >= 0 ? index : 0, alpha);
         }
 
         function computeCategoryTotals(categories) {
@@ -1098,9 +1226,10 @@ $defaultHistoryHours = $historyData['hours'];
                         const row = instancePoints.get(timestamp);
                         return row ? Number(row.dl_speed) || 0 : 0;
                     }),
-                    backgroundColor: makeColor(`${instanceName}-dl`, 0.16),
-                    borderColor: makeColor(`${instanceName}-dl`, 0.78),
-                    borderWidth: 1.4,
+                    backgroundColor: makeInstanceColor(instanceName, 0.05),
+                    borderColor: makeInstanceColor(instanceName, 0.72),
+                    borderWidth: 1.5,
+                    borderDash: [7, 5],
                     fill: true,
                     tension: 0.24,
                     stack: 'download',
@@ -1118,9 +1247,9 @@ $defaultHistoryHours = $historyData['hours'];
                         const row = instancePoints.get(timestamp);
                         return row ? Number(row.up_speed) || 0 : 0;
                     }),
-                    backgroundColor: makeColor(`${instanceName}-up`, 0.08),
-                    borderColor: makeColor(`${instanceName}-up`, 0.48),
-                    borderWidth: 1.1,
+                    backgroundColor: makeInstanceColor(instanceName, 0.12),
+                    borderColor: makeInstanceColor(instanceName, 0.96),
+                    borderWidth: 1.8,
                     fill: true,
                     tension: 0.24,
                     stack: 'upload',
@@ -1198,6 +1327,237 @@ $defaultHistoryHours = $historyData['hours'];
             }
 
             historyChartInstance.$timestamps = model.timestamps;
+        }
+
+        function buildCategoryUploadHistoryModel(history) {
+            const timestamps = Array.isArray(history?.timestamps) ? history.timestamps : [];
+            const labels = timestamps.map(formatTimeLabel);
+            const series = Array.isArray(history?.series) ? history.series : [];
+            const datasets = series.map((item, index) => {
+                const rawData = Array.isArray(item.data)
+                    ? item.data.map(value => Number(value) || 0)
+                    : [];
+
+                return {
+                    label: item.category,
+                    data: smoothCategoryHistoryValues(rawData),
+                    $rawData: rawData,
+                    borderColor: makeDistinctSeriesColor(index, 0.92, 24),
+                    backgroundColor: makeDistinctSeriesColor(index, 0.08, 24),
+                    borderWidth: 1.8,
+                    fill: false,
+                    tension: 0.5,
+                    cubicInterpolationMode: 'monotone',
+                    spanGaps: true,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                };
+            });
+
+            return {
+                timestamps,
+                labels,
+                datasets,
+            };
+        }
+
+        function smoothCategoryHistoryValues(values, radius = 3) {
+            if (values.length < 3) {
+                return [...values];
+            }
+
+            return values.map((value, index) => {
+                let weightedTotal = 0;
+                let totalWeight = 0;
+
+                for (let offset = -radius; offset <= radius; offset++) {
+                    const sourceIndex = index + offset;
+                    if (sourceIndex < 0 || sourceIndex >= values.length) {
+                        continue;
+                    }
+
+                    const weight = radius + 1 - Math.abs(offset);
+                    weightedTotal += values[sourceIndex] * weight;
+                    totalWeight += weight;
+                }
+
+                return totalWeight > 0 ? weightedTotal / totalWeight : value;
+            });
+        }
+
+        function getCategoryHistoryRawValue(dataset, dataIndex) {
+            const values = Array.isArray(dataset?.$rawData) ? dataset.$rawData : dataset?.data;
+            return Number(values?.[dataIndex]) || 0;
+        }
+
+        function getCategoryTooltipDatasetIndexes(chart, dataIndex, limit = 15) {
+            const anchorY = Number.isFinite(chart.$tooltipAnchorY)
+                ? chart.$tooltipAnchorY
+                : chart.chartArea.top;
+            const cached = chart.$tooltipRanking;
+            if (cached && cached.dataIndex === dataIndex && cached.anchorY === anchorY) {
+                return cached.indexes;
+            }
+
+            const ranked = chart.data.datasets
+                .map((dataset, index) => ({
+                    index,
+                    value: getCategoryHistoryRawValue(dataset, dataIndex),
+                }))
+                .filter(item => chart.isDatasetVisible(item.index))
+                .sort((left, right) => (right.value - left.value) || (left.index - right.index));
+            let anchorRank = 0;
+            let nearestDistance = Number.POSITIVE_INFINITY;
+
+            ranked.forEach((item, rank) => {
+                const plottedValue = Number(chart.data.datasets[item.index]?.data?.[dataIndex]) || 0;
+                const plottedY = chart.scales.y.getPixelForValue(plottedValue);
+                const distance = Math.abs(plottedY - anchorY);
+
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    anchorRank = rank;
+                }
+            });
+
+            const maximumStart = Math.max(0, ranked.length - limit);
+            const windowStart = Math.min(
+                maximumStart,
+                Math.max(0, anchorRank - Math.floor(limit / 2))
+            );
+            const indexes = new Set(
+                ranked.slice(windowStart, windowStart + limit).map(item => item.index)
+            );
+            chart.$tooltipRanking = { dataIndex, anchorY, indexes };
+
+            return indexes;
+        }
+
+        const categoryTooltipWindowPlugin = {
+            id: 'categoryTooltipWindow',
+            beforeEvent(chart, args) {
+                if (args.event.type === 'mousemove') {
+                    chart.$tooltipAnchorY = args.event.y;
+                    chart.$tooltipRanking = null;
+                } else if (args.event.type === 'mouseout') {
+                    chart.$tooltipAnchorY = null;
+                    chart.$tooltipRanking = null;
+                }
+            },
+        };
+
+        function renderCategoryHistoryLegend() {
+            const legend = document.getElementById('categoryHistoryLegend');
+            if (!legend || !categoryHistoryChartInstance) {
+                return;
+            }
+
+            legend.innerHTML = categoryHistoryChartInstance.data.datasets.map((dataset, index) => `
+                <button type="button" data-dataset-index="${index}" aria-pressed="${categoryHistoryChartInstance.isDatasetVisible(index) ? 'true' : 'false'}">
+                    <span class="series-swatch" style="--series-color: ${dataset.borderColor}"></span>
+                    <span>${escapeHtml(dataset.label)}</span>
+                </button>
+            `).join('');
+
+            legend.querySelectorAll('button[data-dataset-index]').forEach(button => {
+                const index = Number(button.dataset.datasetIndex);
+                button.classList.toggle('is-hidden', !categoryHistoryChartInstance.isDatasetVisible(index));
+
+                button.addEventListener('click', () => {
+                    const nextVisible = !categoryHistoryChartInstance.isDatasetVisible(index);
+                    categoryHistoryChartInstance.setDatasetVisibility(index, nextVisible);
+                    categoryHistoryChartInstance.$tooltipRanking = null;
+                    button.classList.toggle('is-hidden', !nextVisible);
+                    button.setAttribute('aria-pressed', nextVisible ? 'true' : 'false');
+                    categoryHistoryChartInstance.update('none');
+                });
+            });
+        }
+
+        function setCategoryHistoryLegendVisible(visible) {
+            const legend = document.getElementById('categoryHistoryLegend');
+            const button = document.getElementById('categoryHistoryLegendToggle');
+            if (!legend || !button) {
+                return;
+            }
+
+            legend.hidden = !visible;
+            button.textContent = visible ? 'Скрыть легенду' : 'Показать легенду';
+            button.setAttribute('aria-expanded', visible ? 'true' : 'false');
+        }
+
+        function renderCategoryUploadHistoryChart() {
+            const model = buildCategoryUploadHistoryModel(historyPayload.category_upload_history || {});
+            const context = document.getElementById('categoryHistoryChart').getContext('2d');
+
+            if (!categoryHistoryChartInstance) {
+                categoryHistoryChartInstance = new Chart(context, {
+                    type: 'line',
+                    data: {
+                        labels: model.labels,
+                        datasets: model.datasets,
+                    },
+                    options: {
+                        animation: false,
+                        maintainAspectRatio: false,
+                        responsive: true,
+                        interaction: {
+                            intersect: false,
+                            mode: 'nearest',
+                            axis: 'xy',
+                        },
+                        scales: {
+                            x: {
+                                grid: {
+                                    display: false,
+                                },
+                            },
+                            y: {
+                                beginAtZero: true,
+                                ticks: {
+                                    callback: value => formatSpeed(value),
+                                },
+                            },
+                        },
+                        plugins: {
+                            legend: {
+                                display: false,
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false,
+                                filter: context => getCategoryTooltipDatasetIndexes(
+                                    context.chart,
+                                    context.dataIndex,
+                                    15
+                                ).has(context.datasetIndex),
+                                itemSort: (left, right) => (
+                                    getCategoryHistoryRawValue(right.dataset, right.dataIndex)
+                                    - getCategoryHistoryRawValue(left.dataset, left.dataIndex)
+                                ),
+                                callbacks: {
+                                    title: items => {
+                                        const timestamp = categoryHistoryChartInstance?.$timestamps?.[items[0]?.dataIndex ?? -1];
+                                        return formatTimestamp(timestamp);
+                                    },
+                                    label: context => `${context.dataset.label}: ${formatSpeed(
+                                        getCategoryHistoryRawValue(context.dataset, context.dataIndex)
+                                    )}`,
+                                },
+                            },
+                        },
+                    },
+                    plugins: [categoryTooltipWindowPlugin],
+                });
+            } else {
+                categoryHistoryChartInstance.data.labels = model.labels;
+                categoryHistoryChartInstance.data.datasets = model.datasets;
+                categoryHistoryChartInstance.update('none');
+            }
+
+            categoryHistoryChartInstance.$timestamps = model.timestamps;
+            categoryHistoryChartInstance.$tooltipRanking = null;
+            renderCategoryHistoryLegend();
         }
 
         function renderCategoryChart(categories, options = {}) {
@@ -1473,6 +1833,7 @@ $defaultHistoryHours = $historyData['hours'];
             selectedHistoryHours = payload.hours || hours;
             document.getElementById('historyHoursSelect').value = String(selectedHistoryHours);
             renderHistoryChart();
+            renderCategoryUploadHistoryChart();
             pruneCategoryCache();
 
             if (pinnedTimestamp && !(historyPayload.data || []).some(item => item.timestamp === pinnedTimestamp)) {
@@ -1588,28 +1949,36 @@ $defaultHistoryHours = $historyData['hours'];
             }, 3200);
         }
 
-        function resolveTimestampFromEvent(event) {
-            if (!historyChartInstance || !historyChartInstance.$timestamps) {
+        function resolveTimestampFromEvent(event, chartInstance, interactionMode = 'nearest') {
+            if (!chartInstance || !chartInstance.$timestamps) {
                 return null;
             }
 
-            const points = historyChartInstance.getElementsAtEventForMode(event, 'nearest', { intersect: false }, false);
+            const interactionOptions = interactionMode === 'index'
+                ? { intersect: false, axis: 'x' }
+                : { intersect: false };
+            const points = chartInstance.getElementsAtEventForMode(
+                event,
+                interactionMode,
+                interactionOptions,
+                false
+            );
             if (!points.length) {
                 return null;
             }
 
-            return historyChartInstance.$timestamps[points[0].index] || null;
+            return chartInstance.$timestamps[points[0].index] || null;
         }
 
-        function attachHistoryInteractions() {
-            const canvas = document.getElementById('historyChart');
+        function attachTimelineInteractions(canvasId, getChartInstance, interactionMode = 'nearest') {
+            const canvas = document.getElementById(canvasId);
 
             canvas.addEventListener('mousemove', event => {
                 if (pinnedTimestamp) {
                     return;
                 }
 
-                const timestamp = resolveTimestampFromEvent(event);
+                const timestamp = resolveTimestampFromEvent(event, getChartInstance(), interactionMode);
                 if (!timestamp || hoveredTimestamp === timestamp) {
                     return;
                 }
@@ -1626,7 +1995,7 @@ $defaultHistoryHours = $historyData['hours'];
             });
 
             canvas.addEventListener('click', async event => {
-                const timestamp = resolveTimestampFromEvent(event);
+                const timestamp = resolveTimestampFromEvent(event, getChartInstance(), interactionMode);
                 if (!timestamp) {
                     return;
                 }
@@ -1642,6 +2011,11 @@ $defaultHistoryHours = $historyData['hours'];
                 hoveredTimestamp = timestamp;
                 await loadCategorySnapshot(timestamp, 'pinned');
             });
+        }
+
+        function attachHistoryInteractions() {
+            attachTimelineInteractions('historyChart', () => historyChartInstance);
+            attachTimelineInteractions('categoryHistoryChart', () => categoryHistoryChartInstance, 'index');
         }
 
         function attachCategorySorting() {
@@ -1677,6 +2051,7 @@ $defaultHistoryHours = $historyData['hours'];
         function boot() {
             updateThemeToggle(getCurrentTheme());
             renderHistoryChart();
+            renderCategoryUploadHistoryChart();
             renderCategoryChart(currentData.categories);
             applyThemeToCharts();
             renderInstancesTable();
@@ -1691,6 +2066,7 @@ $defaultHistoryHours = $historyData['hours'];
             const historyHoursSelect = document.getElementById('historyHoursSelect');
             const clearSelectionButton = document.getElementById('clearSelectionButton');
             const themeToggleButton = document.getElementById('themeToggleButton');
+            const categoryHistoryLegendToggle = document.getElementById('categoryHistoryLegendToggle');
 
             const storedAutoRefresh = localStorage.getItem('qbitStatsAutoRefresh');
             const autoRefreshEnabled = storedAutoRefresh === null ? true : storedAutoRefresh === 'true';
@@ -1703,6 +2079,11 @@ $defaultHistoryHours = $historyData['hours'];
 
             themeToggleButton.addEventListener('click', () => {
                 applyTheme(getCurrentTheme() === 'dark' ? 'light' : 'dark');
+            });
+
+            categoryHistoryLegendToggle.addEventListener('click', () => {
+                const legend = document.getElementById('categoryHistoryLegend');
+                setCategoryHistoryLegendVisible(legend.hidden);
             });
 
             autoRefreshCheckbox.addEventListener('change', event => {

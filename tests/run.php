@@ -139,9 +139,23 @@ try {
 
     $history = get_history_data($db, $config, 6);
     assert_same(['active'], array_values(array_unique(array_column($history['data'], 'instance_name'))), 'Removed instances must be excluded from speed history');
+    assert_same(['A'], array_column($history['category_upload_history']['series'], 'category'), 'Removed instances must be excluded from category upload history');
 
     $categorySnapshot = get_category_history($db, $config, $historyTimestamp);
     assert_same(['A'], array_column($categorySnapshot, 'category'), 'Removed instances must be excluded from category history');
+
+    for ($index = 1; $index <= 13; $index++) {
+        $categoryHistory->bindValue(':instance_name', 'active', SQLITE3_TEXT);
+        $categoryHistory->bindValue(':category', 'extra-' . $index, SQLITE3_TEXT);
+        $categoryHistory->bindValue(':timestamp', $historyTimestamp, SQLITE3_TEXT);
+        $categoryHistory->execute();
+    }
+
+    $allCategoryHistory = get_history_data($db, $config, 6)['category_upload_history'];
+    assert_same(14, count($allCategoryHistory['series']), 'Category upload history must not limit the number of categories');
+    foreach ($allCategoryHistory['series'] as $series) {
+        assert_same(count($allCategoryHistory['timestamps']), count($series['data']), 'Every category series must align with the shared timeline');
+    }
 
     $db->close();
     echo "All regression tests passed\n";

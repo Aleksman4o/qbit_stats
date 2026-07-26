@@ -104,11 +104,16 @@ function get_history_data(SQLite3 $db, array $config, int $hours): array
     $cutoff = date('Y-m-d H:i:s', time() - ($normalizedHours * 3600));
     $instanceNames = get_configured_instance_names($config);
     $rows = [];
+    $categoryUploadHistory = [
+        'timestamps' => [],
+        'series' => [],
+    ];
 
     if (empty($instanceNames)) {
         return [
             'hours' => $normalizedHours,
             'data' => $rows,
+            'category_upload_history' => $categoryUploadHistory,
         ];
     }
 
@@ -131,9 +136,62 @@ function get_history_data(SQLite3 $db, array $config, int $hours): array
         $rows[] = $row;
     }
 
+    $categoryPlaceholders = create_sqlite_placeholders($instanceNames, 'category_upload_instance_');
+    $categoryStmt = $db->prepare('
+        SELECT
+            category_history.timestamp,
+            category_history.category,
+            SUM(category_history.up_speed) AS up_speed
+        FROM category_history
+        WHERE category_history.timestamp >= :category_cutoff
+          AND category_history.instance_name IN (' . implode(', ', $categoryPlaceholders) . ')
+        GROUP BY category_history.timestamp, category_history.category
+        ORDER BY category_history.timestamp ASC, category_history.category ASC');
+    $categoryStmt->bindValue(':category_cutoff', $cutoff, SQLITE3_TEXT);
+    bind_sqlite_text_values($categoryStmt, $instanceNames, 'category_upload_instance_');
+    $categoryResult = $categoryStmt->execute();
+    $timestampIndexes = [];
+    $categoryPoints = [];
+    $categoryTotals = [];
+
+    while ($row = $categoryResult->fetchArray(SQLITE3_ASSOC)) {
+        $timestamp = $row['timestamp'];
+        $category = $row['category'];
+        $upSpeed = (int)$row['up_speed'];
+
+        if (!isset($timestampIndexes[$timestamp])) {
+            $timestampIndexes[$timestamp] = count($categoryUploadHistory['timestamps']);
+            $categoryUploadHistory['timestamps'][] = $timestamp;
+        }
+
+        $categoryPoints[$category][$timestampIndexes[$timestamp]] = $upSpeed;
+        $categoryTotals[$category] = ($categoryTotals[$category] ?? 0) + $upSpeed;
+    }
+
+    uksort($categoryPoints, function (string $left, string $right) use ($categoryTotals): int {
+        $totalComparison = ($categoryTotals[$right] ?? 0) <=> ($categoryTotals[$left] ?? 0);
+
+        return $totalComparison !== 0 ? $totalComparison : strnatcasecmp($left, $right);
+    });
+
+    $pointCount = count($categoryUploadHistory['timestamps']);
+    foreach ($categoryPoints as $category => $points) {
+        $values = array_fill(0, $pointCount, 0);
+
+        foreach ($points as $index => $upSpeed) {
+            $values[$index] = $upSpeed;
+        }
+
+        $categoryUploadHistory['series'][] = [
+            'category' => $category,
+            'data' => $values,
+        ];
+    }
+
     return [
         'hours' => $normalizedHours,
         'data' => $rows,
+        'category_upload_history' => $categoryUploadHistory,
     ];
 }
 
