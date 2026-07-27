@@ -51,40 +51,61 @@ try {
     file_put_contents($iniPath, <<<'INI'
 [other]
 user_version="3"
-qt="7"
+qt="5"
 
-[client-1]
-id="1"
+[torrent-client-1]
+id="39"
 client="qbittorrent"
 hostname="one.example"
 port="8080"
 comment="one"
 
-[client-7]
-id="7"
-client="qbittorrent"
-hostname="seven.example"
-port="8080"
-comment="seven"
+[torrent-client-2]
+id="40"
+client="transmission"
+hostname="transmission.example"
+port="9091"
+comment="transmission"
 
-[client-8]
-id="8"
+[torrent-client-3]
+id="41"
 client="qbittorrent"
-hostname="eight.example"
+hostname="three.example"
 port="8080"
-comment="eight"
+comment="three"
 
-[client-without-id]
+[torrent-client-4]
+id="42"
 client="qbittorrent"
-hostname="unknown.example"
+hostname="excluded.example"
 port="8080"
-comment="unknown"
+comment="excluded"
+exclude="1"
+
+[torrent-client-5]
+id="43"
+client="utorrent"
+hostname="utorrent.example"
+port="8080"
+comment="utorrent"
+
+[torrent-client-6]
+id="44"
+client="qbittorrent"
+hostname="stale.example"
+port="8080"
+comment="stale"
 INI);
     $parsedClientsConfig = parseClientsConfig($iniPath);
     assert_same(
-        ['one', 'seven'],
+        ['one', 'three'],
         array_column($parsedClientsConfig['instances'], 'name'),
-        'Only qBittorrent clients up to and including [other] qt must be configured'
+        'Only active, non-excluded qBittorrent sections within [other] qt must be configured'
+    );
+    assert_same(
+        [39, 41],
+        array_column($parsedClientsConfig['instances'], 'id'),
+        'Torrent client IDs must not be limited by the [other] qt section count'
     );
     assert_same(20, get_monitor_settings([])['parallel_sync_limit'], 'The default parallel request limit must support larger installations');
 

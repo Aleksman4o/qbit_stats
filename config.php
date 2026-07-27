@@ -33,17 +33,29 @@ function parseClientsConfig(?string $iniFileOverride = null) {
         throw new Exception("Failed to parse INI file. Check file syntax.");
     }
 
-    $lastActiveClientId = null;
+    $activeClientCount = null;
     if (array_key_exists('qt', $iniContent['other'] ?? [])) {
-        $lastActiveClientId = parseIniInteger($iniContent['other']['qt']);
+        $activeClientCount = parseIniInteger($iniContent['other']['qt']);
 
-        if ($lastActiveClientId === null || $lastActiveClientId < 0) {
-            throw new Exception("Invalid [other] qt in config.ini. Expected a non-negative client ID.");
+        if ($activeClientCount === null || $activeClientCount < 0) {
+            throw new Exception("Invalid [other] qt in config.ini. Expected a non-negative client count.");
+        }
+    }
+
+    $clientSections = $iniContent;
+    if ($activeClientCount !== null) {
+        $clientSections = [];
+
+        for ($sectionNumber = 1; $sectionNumber <= $activeClientCount; $sectionNumber++) {
+            $section = 'torrent-client-' . $sectionNumber;
+            if (isset($iniContent[$section]) && is_array($iniContent[$section])) {
+                $clientSections[$section] = $iniContent[$section];
+            }
         }
     }
 
     $instances = [];
-    foreach ($iniContent as $section => $client) {
+    foreach ($clientSections as $section => $client) {
         // Пропускаем секции без обязательных полей
         if (!isset($client['client']) || !isset($client['hostname']) || !isset($client['port'])) {
             continue;
@@ -55,9 +67,6 @@ function parseClientsConfig(?string $iniFileOverride = null) {
         }
 
         $clientId = parseIniInteger($client['id'] ?? null);
-        if ($lastActiveClientId !== null && ($clientId === null || $clientId > $lastActiveClientId)) {
-            continue;
-        }
 
         $protocol = ($client['ssl'] ?? 0) == 1 ? 'https://' : 'http://';
         $url = $protocol . $client['hostname'] . ':' . $client['port'];

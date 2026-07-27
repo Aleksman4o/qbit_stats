@@ -1,6 +1,6 @@
 <?php
 
-const QBIT_STATS_VERSION = '0.6.4';
+const QBIT_STATS_VERSION = '0.6.5';
 const QBIT_STATS_LATEST_RELEASE_API_URL = 'https://api.github.com/repos/Aleksman4o/qbit_stats/releases/latest';
 
 $config = require __DIR__ . '/config.php';
